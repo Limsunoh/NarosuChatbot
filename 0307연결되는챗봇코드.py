@@ -397,7 +397,7 @@ def search_and_generate_response2(request: Union[QueryRequest, str], session_id:
         # ✅ [Step 7] 엑셀 데이터 로드
         excel_start = time.time()
         try:
-            _, data = load_excel_to_texts("db/ownerclan_narosu_오너클랜상품리스트_OWNERCLAN_250102 필요한 내용만.xlsx")
+            _, data = load_excel_to_texts("db/속성39개정제_만개데이터.xlsx")
         except Exception as e:
             raise ValueError(f"❌ [ERROR] 엑셀 데이터 로딩 실패: {e}")
         
