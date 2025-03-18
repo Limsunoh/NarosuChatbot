@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="ko">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FAISS 검색 API 테스트</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+    <style>
+        body {
+            font-family: 'Arial', sans-serif;
+            background: linear-gradient(120deg, #f6f7f9, #dfe9f3);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+
+        .chat-container {
+            width: 600px;
+            height: 1000px;
+            background: #ffffff;
+            border-radius: 15px;
+            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .chat-header {
+            background: #4a90e2;
+            color: white;
+            text-align: center;
+            padding: 15px;
+            font-size: 24px;
+            border-radius: 15px 15px 0 0;
+            font-weight: bold;
+        }
+
+        .chat-messages {
+            flex: 1;
+            padding: 20px;
+            overflow-y: auto;
+            background: #f5f7fa;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .message {
+            padding: 10px 15px;
+            border-radius: 20px;
+            max-width: 70%;
+            font-size: 16px;
+        }
+
+        .user {
+            align-self: flex-end;
+            background: #4a90e2;
+            color: white;
+        }
+
+        .bot {
+            align-self: flex-start;
+            background: #e0e0e0;
+            color: black;
+        }
+
+        .chat-input {
+            display: flex;
+            border-top: 1px solid #ddd;
+            padding: 10px;
+            background: white;
+        }
+
+        .chat-input input {
+            flex: 1;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 20px;
+            outline: none;
+            font-size: 16px;
+        }
+
+        .chat-input button {
+            padding: 10px 20px;
+            border: none;
+            background: #4a90e2;
+            color: white;
+            cursor: pointer;
+            border-radius: 20px;
+            margin-left: 10px;
+            font-size: 16px;
+            transition: background 0.3s;
+        }
+
+        .chat-input button:hover {
+            background: #357ab8;
+        }
+
+        #json-results {
+            background: #e8e8e8;
+            padding: 10px;
+            border-radius: 10px;
+            font-family: monospace;
+            white-space: pre-wrap;
+            overflow-wrap: break-word;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="chat-container">
+        <div class="chat-header">💬 FAISS 검색 API 테스트</div>
+        <div class="chat-messages" id="chat-messages"></div>
+        <div class="chat-input">
+            <input type="text" id="user-input" placeholder="질문을 입력하세요...">
+            <button onclick="sendMessage()">전송</button>
+        </div>
+        <div class="chat-messages" id="json-results"></div>
+    </div>
+
+    <script>
+        async function sendMessage() {
+            const userInput = document.getElementById('user-input').value.trim();
+            if (!userInput) {
+                alert("질문을 입력해주세요!");
+                return;
+            }
+
+            const messageBox = document.getElementById('chat-messages');
+            const jsonBox = document.getElementById('json-results');
+            messageBox.innerHTML += `<div class="message user">👤 ${userInput}</div>`;
+            document.getElementById('user-input').value = '';
+
+            try {
+                const host = window.location.hostname;
+                const response = await fetch(`http://${host}:5050/chatbot`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query: userInput })
+                });
+
+                const data = await response.json();
+
+                // ✅ JSON 결과 영역에 LLM 응답 포함
+                jsonBox.innerHTML = `<div class="message bot"><pre>${JSON.stringify(data, null, 2)}</pre></div>`;
+
+                // ✅ 검색 결과 메시지 출력
+                if (data.results && data.results.length > 0) {
+                    data.results.forEach(item => {
+                        messageBox.innerHTML += `
+                            <div class="message bot">
+                                <strong>상품코드:</strong> ${item.상품코드}<br>
+                                <strong>원본상품명:</strong> ${item.원본상품명}<br>
+                                <strong>오너클랜판매가:</strong> ${item.오너클랜판매가}원<br>
+                                <strong>배송비:</strong> ${item.배송비}원<br>
+                                <strong>원산지:</strong> ${item.원산지}<br>
+                                <img src="${item.이미지중}" alt="상품 이미지" style="width: 150px; border-radius: 10px;">
+                            </div>`;
+                    });
+                } else {
+                    messageBox.innerHTML += `<div class="message bot">❗ 검색 결과가 없습니다.</div>`;
+                }
+
+                // ✅ LLM 응답을 대화창 하단에 표시
+                messageBox.innerHTML += `<div class="message bot"><strong>💡 챗봇봇 응답:</strong> ${data.llm_response}</div>`;
+
+            } catch (error) {
+                console.error("에러 발생:", error);
+                messageBox.innerHTML += `<div class="message bot">❗ 서버 연결 오류</div>`;
+            }
+
+            messageBox.scrollTop = messageBox.scrollHeight;
+        }
+    </script>
+</body>
+
+</html>
