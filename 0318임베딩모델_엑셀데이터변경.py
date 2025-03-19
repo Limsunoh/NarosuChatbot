@@ -1,7 +1,6 @@
 from dotenv import load_dotenv
 import os
 import pandas as pd
-import json
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 import faiss
 import numpy as np
@@ -29,7 +28,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import tiktoken
 import re
-
+import tqdm
 
 executor = ThreadPoolExecutor()
 
@@ -46,7 +45,7 @@ print(f"🔍 로드된 PAGE_ACCESS_TOKEN: {PAGE_ACCESS_TOKEN}")
 
 
 # ✅ FAISS 인덱스 파일 경로 설정
-faiss_file_path = f"faiss_index_03M.faiss"
+faiss_file_path = f"faiss_index_02M.faiss"
 
 def get_redis():
     return redis.Redis.from_url(REDIS_URL)
@@ -110,12 +109,15 @@ def convert_to_serializable(obj):
         return obj.item()
     return obj
 
-# ✅ 엑셀 데이터 로드 및 변환 (공백 제거)
+# ✅ 엑셀 데이터 로드 및 변환 (한 줄을 문장으로 처리하고 최대 토큰 초과 방지)
 def load_excel_to_texts(file_path):
     try:
         data = pd.read_excel(file_path)
         data.columns = data.columns.str.strip()
+        
+        # 🔹 한 줄 문장으로 변환 (각 열을 하나의 문자열로 조합)
         texts = [" | ".join([f"{col}: {row[col]}" for col in data.columns]) for _, row in data.iterrows()]
+        
         return texts, data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"엑셀 파일 로드 오류: {str(e)}")
@@ -157,87 +159,97 @@ def load_faiss_index(file_path):
 #         print(f"❌ FAISS 인덱스 생성 및 저장 오류: {e}")
 # =======================================여기까지가 기존 임베딩 생성 및 저장. 데이터가 늘어나고 임베딩 모델이 바뀜에 따라 429 Too Many Requests 오류 발생
 
+def split_text_into_chunks(texts, max_tokens=8000):
+    encoding = tiktoken.encoding_for_model("text-embedding-3-small")
+    chunks = []
+    
+    for text in texts:
+        token_count = len(encoding.encode(text))
+        
+        # ✅ 최대 토큰을 초과하는 경우 문장을 나눠서 저장
+        if token_count > max_tokens:
+            sentences = re.split(r'(?<=[.!?]) +', text)  # 문장 단위로 나누기
+            current_chunk = []
+            current_length = 0
+
+            for sentence in sentences:
+                sentence_tokens = len(encoding.encode(sentence))
+                if current_length + sentence_tokens > max_tokens:
+                    chunks.append(" ".join(current_chunk))  # 현재 청크 저장
+                    current_chunk = [sentence]
+                    current_length = sentence_tokens
+                else:
+                    current_chunk.append(sentence)
+                    current_length += sentence_tokens
+
+            if current_chunk:
+                chunks.append(" ".join(current_chunk))  # 마지막 남은 문장 추가
+        else:
+            chunks.append(text)  # 토큰 수가 초과하지 않으면 그대로 추가
+
+    return chunks
+
+# ✅ OpenAI 임베딩 요청 (배치 크기 조절 및 오류 복구)
+def get_embeddings(text_chunks, model_name="text-embedding-3-small", batch_size=5):
+    API_KEY = os.getenv("OPENAI_API_KEY")
+    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    url = "https://api.openai.com/v1/embeddings"
+    embeddings = []
+
+    start_time = time.time()
+    batch_count = len(text_chunks) // batch_size + (1 if len(text_chunks) % batch_size != 0 else 0)
+
+    with tqdm.tqdm(total=batch_count, desc="🔄 임베딩 진행 중", unit="batch") as pbar:
+        for i in range(0, len(text_chunks), batch_size):
+            batch = text_chunks[i:i + batch_size]
+            data = {"model": model_name, "input": batch}
+
+            for attempt in range(5):  # 최대 5회 재시도
+                try:
+                    response = requests.post(url, headers=headers, json=data)
+                    response.raise_for_status()
+                    json_response = response.json()
+                    batch_embeddings = [res["embedding"] for res in json_response["data"]]
+                    embeddings.extend(batch_embeddings)
+
+                    elapsed_time = time.time() - start_time
+                    pbar.update(1)
+                    pbar.set_postfix({
+                        "완료": f"{len(embeddings)}/{len(text_chunks)}",
+                        "시간": f"{elapsed_time:.2f} 초"
+                    })
+
+                    time.sleep(1)  # 요청 간격 조절
+                    break
+                except requests.exceptions.RequestException as e:
+                    wait_time = 2 ** attempt
+                    print(f"⚠️ OpenAI API 오류 발생 (시도 {attempt+1}/5): {e}")
+                    print(f"⏳ {wait_time}초 후 재시도...")
+                    time.sleep(wait_time)
+
+    return embeddings
+
+
+
+
+
+
+
+# ✅ FAISS 인덱스 생성 및 저장
 def create_and_save_faiss_index(file_path):
     try:
         print("🚀 FAISS 인덱스 생성 시작...")
 
-        # ✅ Step 1: 엑셀에서 텍스트 데이터 로드
+        # 🔹 한 줄 문장으로 변환된 텍스트 로드
         texts, _ = load_excel_to_texts(file_path)
         print(f"✅ 텍스트 데이터 로드 완료. 총 {len(texts)}개 항목")
 
-        # ✅ Step 2: 문장 단위로 분할하여 청크 생성
-        def split_text_into_chunks(texts, max_tokens=8000):
-            encoding = tiktoken.encoding_for_model("text-embedding-3-small")
-            chunks = []
-            current_chunk = []
-            current_length = 0
-
-            for text in texts:
-                sentences = re.split(r'(?<=[.!?]) +', text)  # 문장 단위 분할
-                for sentence in sentences:
-                    token_count = len(encoding.encode(sentence)) 
-                    if current_length + token_count > max_tokens:  
-                        chunks.append(" ".join(current_chunk))
-                        current_chunk = [sentence]
-                        current_length = token_count
-                    else:
-                        current_chunk.append(sentence)
-                        current_length += token_count
-
-            if current_chunk:
-                chunks.append(" ".join(current_chunk))  # 남은 문장도 추가
-
-            return chunks
-
+        # 🔹 문장을 적절한 크기로 분할하여 토큰 제한 초과 방지
         text_chunks = split_text_into_chunks(texts)
-        total_chunks = len(text_chunks)  # 전체 청크 개수
+        total_chunks = len(text_chunks)
         print(f"✅ 총 {total_chunks}개의 텍스트 청크 생성 완료.")
 
-        # ✅ Step 3: OpenAI 임베딩 생성 (진행률 + ETA 계산 추가)
-        def get_embeddings(text_chunks, model_name="text-embedding-3-small", batch_size=5):
-            API_KEY = os.getenv("OPENAI_API_KEY")
-            headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
-            url = "https://api.openai.com/v1/embeddings"
-            embeddings = []
-
-            start_time = time.time()  # ✅ 시작 시간 기록
-            batch_count = len(text_chunks) // batch_size + (1 if len(text_chunks) % batch_size != 0 else 0)
-
-            with tqdm(total=batch_count, desc="🔄 임베딩 진행 중", unit="batch") as pbar:
-                for i in range(0, len(text_chunks), batch_size):
-                    batch = text_chunks[i:i + batch_size]
-                    data = {"model": model_name, "input": batch}
-
-                    for attempt in range(5):  # 최대 5회 재시도
-                        try:
-                            batch_start = time.time()
-                            response = requests.post(url, headers=headers, json=data)
-                            response.raise_for_status()
-                            json_response = response.json()
-                            batch_embeddings = [res["embedding"] for res in json_response["data"]]
-                            embeddings.extend(batch_embeddings)
-
-                            elapsed_time = time.time() - start_time  # 총 경과 시간
-                            avg_time_per_batch = elapsed_time / (i // batch_size + 1)  # 평균 배치 시간
-                            remaining_batches = batch_count - (i // batch_size + 1)
-                            eta = remaining_batches * avg_time_per_batch  # 예상 남은 시간 계산
-
-                            pbar.update(1)  # ✅ 진행 상태 업데이트
-                            pbar.set_postfix({
-                                "완료": f"{len(embeddings)}/{total_chunks}",
-                                "ETA": f"{eta:.2f} 초"
-                            })
-
-                            time.sleep(1)  # 요청 간격 최소화
-                            break
-                        except requests.exceptions.RequestException as e:
-                            wait_time = 2 ** attempt  # 지수 백오프 (2, 4, 8, 16, 32초)
-                            print(f"⚠️ OpenAI API 오류 발생 (시도 {attempt+1}/5): {e}")
-                            print(f"⏳ {wait_time}초 후 재시도...")
-                            time.sleep(wait_time)
-
-            return embeddings
-
+        # 🔹 OpenAI 임베딩 생성
         embeddings = get_embeddings(text_chunks)
         if not embeddings:
             raise ValueError("❌ [ERROR] 임베딩 생성 실패! FAISS 인덱스 저장 불가.")
@@ -245,33 +257,26 @@ def create_and_save_faiss_index(file_path):
         embeddings = np.array(embeddings, dtype=np.float32)
         faiss.normalize_L2(embeddings)  # 정규화
 
-        # ✅ Step 4: FAISS 인덱스 생성 및 학습
+        # 🔹 FAISS 인덱스 생성 및 학습
         d = embeddings.shape[1]
-        nlist = 200  # 클러스터 개수
+        nlist = max(10, len(text_chunks) // 100)  # 자동 클러스터 개수 조정
         quantizer = faiss.IndexFlatL2(d)
         index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
 
-        index.train(embeddings)  # FAISS 학습
-        index.add(embeddings)  # 데이터 추가
-        print(f"✅ 현재 FAISS 인덱스에 저장된 벡터 개수: {index.ntotal}")
+        index.train(embeddings)
+        index.add(embeddings)
+        print(f"✅ FAISS 인덱스에 저장된 벡터 개수: {index.ntotal}")
 
-        # ✅ Step 5: FAISS 인덱스 저장
+        # 🔹 FAISS 인덱스 저장
         save_faiss_index(index, faiss_file_path)
 
-        # ✅ 저장 여부 확인
         if os.path.exists(faiss_file_path):
             print(f"✅ FAISS 인덱스 저장 완료: {faiss_file_path}")
-
-
         else:
             raise FileNotFoundError(f"❌ [ERROR] FAISS 인덱스 파일이 저장되지 않았습니다: {faiss_file_path}")
-        
+
     except Exception as e:
         print(f"❌ FAISS 인덱스 생성 및 저장 오류: {e}")
-
-
-
-
 
 
 # ✅ FAISS 인덱스 로드 또는 생성
