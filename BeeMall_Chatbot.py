@@ -431,7 +431,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             raise ValueError(f"❌ [ERROR] FAISS 검색 실패: {e}")
 
         faiss_time = time.time() - faiss_start
-        print(f"📊 [Step 9] FAISS 검색 시간: {faiss_time:.4f} 초")
+        print(f"📊 [Step 9] FAISS 검색 시간: {faiss_time:.4f} 초")g
 
 
         # ✅ [Step 10] 검색 결과 유효성 검사
@@ -677,7 +677,7 @@ def search_and_generate_response(request: QueryRequest):
         query_embedding = np.array([query_embedding], dtype=np.float32)
         faiss.normalize_L2(query_embedding)
 
-        # ✅ FAISS 검색 수행
+        # ✅ FAISS 검색 수행(가장 가까운 상위 5개 벡터의 거리(D)와 인덱스(I)를 반환)
         D, I = index.search(query_embedding, k=5)
 
         # ✅ FAISS 검색 결과 검사
@@ -694,7 +694,7 @@ def search_and_generate_response(request: QueryRequest):
 
 
 
-        # ✅ 검색 결과 JSON 변환
+        # ✅ 검색 결과 JSON 변환  (엑셀 속성을 따로 매칭)
         results = []
         for idx_list in I:  # 2차원 배열 처리
             for idx in idx_list:
