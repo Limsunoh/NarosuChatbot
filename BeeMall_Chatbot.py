@@ -431,7 +431,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             raise ValueError(f"❌ [ERROR] FAISS 검색 실패: {e}")
 
         faiss_time = time.time() - faiss_start
-        print(f"📊 [Step 9] FAISS 검색 시간: {faiss_time:.4f} 초")g
+        print(f"📊 [Step 9] FAISS 검색 시간: {faiss_time:.4f} 초")
 
 
         # ✅ [Step 10] 검색 결과 유효성 검사
