@@ -325,7 +325,7 @@ async def process_ai_response(sender_id: str, user_message: str):
 
         # AI 응답 생성 (비동기 처리)
         loop = asyncio.get_running_loop()
-        bot_response = await loop.run_in_executor(executor, search_and_generate_response2, user_message, sender_id)
+        bot_response = await loop.run_in_executor(executor, external_search_and_generate_response, user_message, sender_id)
 
         # 응답 확인 후 ManyChat API로 최종 메시지 전송
         if isinstance(bot_response, dict) and "response" in bot_response:
@@ -340,10 +340,10 @@ async def process_ai_response(sender_id: str, user_message: str):
 
 
 ################################################################
-# search_and_generate_response2는 ManyChat 같은 외부 서비스와 연동되는 챗봇용 API이고, 구축된 UI 에는 사용되지 않음.
+# external_search_and_generate_response는 ManyChat 같은 외부 서비스와 연동되는 챗봇용 API이고, 구축된 UI 에는 사용되지 않음.
 
 
-def search_and_generate_response2(request: Union[QueryRequest, str], session_id: str = None) -> dict:  
+def external_search_and_generate_response(request: Union[QueryRequest, str], session_id: str = None) -> dict:  
     
     # ✅ [Step 1] 요청 데이터 확인
     query = request
@@ -545,7 +545,7 @@ def search_and_generate_response2(request: Union[QueryRequest, str], session_id:
     
         # 전체 처리 시간 로깅
         total_time = time.time() - start_time
-        logger.info(f"📊 [Total Time] 전체 search_and_generate_response2 처리 시간: {total_time:.4f} 초")
+        logger.info(f"📊 [Total Time] 전체 external_search_and_generate_response 처리 시간: {total_time:.4f} 초")
 
     except Exception as e:
         print(f"❌ 오류 발생: {e}")
@@ -625,8 +625,9 @@ def send_message(recipient_id: str, message_text: str):
 async def serve_home(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
-# ✅ POST 요청 처리 - `/chatbot`
 
+
+# ✅ POST 요청 처리 - `/chatbot`
 ################################################################
 # search_and_generate_response는 UI 디자인이 된 웹 UI와 연결된 API 기본적인 API 요청을 통해 JSON 형태의 데이터를 주고 받음.
 
