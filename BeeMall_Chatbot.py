@@ -42,8 +42,9 @@ print(f"🔍 로드된 PAGE_ACCESS_TOKEN: {PAGE_ACCESS_TOKEN}")
 print(f"🔍 로드된 API_KEY: {API_KEY}")
 
 # ✅ FAISS 인덱스 파일 경로 설정
-faiss_file_path = f"faiss_index_02M.faiss"
-# 임베딩 모델 설정 변경필요성 있음
+faiss_file_path = f"03_24_faiss_index_3s.faiss"
+
+EMBEDDING_MODEL = "text-embedding-3-small"
 
 def get_redis():
     return redis.Redis.from_url(REDIS_URL)
@@ -131,32 +132,60 @@ def load_faiss_index(file_path):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"FAISS 인덱스 로딩 오류: {str(e)}")
 
-# ✅ FAISS 인덱스 생성 및 저장 (IndexIVFFlat 적용 - 벡터를 여러 개의 클러스터(nlist 개수)로 그룹화한 후 검색할 때 일부 클러스터에서만 탐색하여 속도를 크게 향상)
+# ✅ 문서 임베딩 함수 (병렬 처리)
+def embed_texts_parallel(texts, embedding_model, max_workers=8):
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            임베딩 = OpenAIEmbeddings(model=embedding_model, openai_api_key=API_KEY)
+            embeddings = list(executor.map(임베딩.embed_query, texts))
+        return np.array(embeddings, dtype=np.float32)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"임베딩 생성 오류: {str(e)}")
+
+# ✅ FAISS 인덱스 생성 및 저장 함수 (병렬 처리 적용)
 def create_and_save_faiss_index(file_path):
     try:
+        start_time = time.time()
+        
+        # 엑셀 파일 로드 및 변환
         texts, _ = load_excel_to_texts(file_path)
-        임베딩 = OpenAIEmbeddings(model="text-embedding-ada-002", openai_api_key=API_KEY)
-        embeddings = 임베딩.embed_documents(texts)
-        embeddings = np.array(embeddings, dtype=np.float32)
-        faiss.normalize_L2(embeddings)
+        print(f"📊 엑셀 파일 로드 및 변환 완료! ({len(texts)}개 텍스트)")
 
-        # ✅ IndexIVFFlat 사용
+        # 임베딩 생성 (병렬 처리 적용)
+        embeddings = embed_texts_parallel(texts, EMBEDDING_MODEL)
+        print(f"📊 임베딩 생성 완료!")
+
+        # FAISS 인덱스 설정
+        faiss.normalize_L2(embeddings)
         d = embeddings.shape[1]
-        nlist = 200  # 클러스터 개수
-        """클러스터 개수 조정할 가능성있음 (선오)"""
+        nlist = min(200, len(texts) // 100)  # 클러스터 개수 설정 (데이터 개수에 비례)
         quantizer = faiss.IndexFlatL2(d)
         index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
+
+        # 인덱스 학습 및 추가
         index.train(embeddings)
         index.add(embeddings)
 
+        # 인덱스 저장
         save_faiss_index(index, faiss_file_path)
+
+        end_time = time.time()
+        print(f"✅ FAISS 인덱스 생성 및 저장 완료! (걸린 시간: {end_time - start_time:.2f} 초)")
+    
     except Exception as e:
         print(f"❌ FAISS 인덱스 생성 및 저장 오류: {e}")
 
-# ✅ FAISS 인덱스 로드 또는 생성
-if not os.path.exists(faiss_file_path):
-    create_and_save_faiss_index("C:\\Users\\lso\\Desktop\\LimSunoh\\chatbotAI\\ai\\db\\ownerclan_narosu_오너클랜상품리스트_OWNERCLAN_250102 필요한 내용만.xlsx")
-index = load_faiss_index(faiss_file_path)
+# ✅ 인덱스 로드 또는 생성하기
+def initialize_faiss_index():
+    if not os.path.exists(faiss_file_path):
+        # 현재 디렉토리의 'db' 폴더 안에서 엑셀 파일을 검색
+        file_path = os.path.join(os.getcwd(), "db", "ownerclan_인기상품_1만개.xlsx")
+        create_and_save_faiss_index(file_path)
+    index = load_faiss_index(faiss_file_path)
+    return index
+
+# ✅ 인덱스 초기화 실행
+index = initialize_faiss_index()
 
 # ✅ LLM을 이용한 키워드 추출 및 대화 이력 반영
 def extract_keywords_with_llm(query):
