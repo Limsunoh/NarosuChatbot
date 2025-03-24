@@ -1,0 +1,2 @@
+*.faiss filter=lfs diff=lfs merge=lfs -text
+333d10c962fc3c9228ab08c8fa41c6c02e8fb913 filter=lfs diff=lfs merge=lfs -text
