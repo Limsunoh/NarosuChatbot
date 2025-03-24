@@ -133,7 +133,7 @@ def load_faiss_index(file_path):
         raise HTTPException(status_code=500, detail=f"FAISS 인덱스 로딩 오류: {str(e)}")
 
 # ✅ 문서 임베딩 함수 (병렬 처리)
-def embed_texts_parallel(texts, embedding_model, max_workers=8):
+def embed_texts_parallel(texts, embedding_model=EMBEDDING_MODEL, max_workers=8):
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             임베딩 = OpenAIEmbeddings(model=embedding_model, openai_api_key=API_KEY)
@@ -180,6 +180,11 @@ def initialize_faiss_index():
     if not os.path.exists(faiss_file_path):
         # 현재 디렉토리의 'db' 폴더 안에서 엑셀 파일을 검색
         file_path = os.path.join(os.getcwd(), "db", "ownerclan_인기상품_1만개.xlsx")
+        
+        # 🔍 엑셀 데이터 로드 확인
+        texts, data = load_excel_to_texts(file_path)
+        print(data.head())  # 데이터의 첫 5개 행 출력 (엑셀 데이터 확인용)
+        
         create_and_save_faiss_index(file_path)
     index = load_faiss_index(faiss_file_path)
     return index
@@ -216,7 +221,7 @@ def extract_keywords_with_llm(query):
 
         # 기존 대화 이력과 함께 LLM에 전달
         response = llm.invoke([
-            SystemMessage(content="사용자의 대화 내역을 반영하여 상품 검색을 위한 정말로 핵심 키워드를 추출해주세요. 만약 단어 간에 띄어쓰기가 있다면 하나의 단어 일수도 있습니다 띄어쓰기가 있다면 단어끼리 붙여서도 문장을 분석해보세요. 여러방법으로 생각해서 추출해주세요. 다른 나라 언어로 질문이 들어오면 질문을 먼저 한글로 번역해서 단어를 추출합니다."),
+            SystemMessage(content="사용자의 대화 내역을 반영하여 상품 검색을 위한 핵심 키워드를 추출해주세요. 만약 단어 간에 띄어쓰기가 있다면 하나의 단어 일수도 있습니다 띄어쓰기가 있다면 단어끼리 붙여서도 문장을 분석해보세요. 여러방법,여러 방면면으로 생각해서 추출해주세요. 다른 나라 언어로 질문이 들어오면 질문을 먼저 한글로 번역해서 단어를 추출합니다."),
             HumanMessage(content=f"질문: {query} \n ")
         ])
 
@@ -233,8 +238,19 @@ def extract_keywords_with_llm(query):
             raise ValueError(f"❌ [ERROR] LLM 응답이 비어 있거나 잘못된 데이터입니다: {response.content}")
 
         # 키워드 업데이트
-        keywords = [keyword.strip() for keyword in response.content.split(",")]
-        combined_keywords = ", ".join(keywords)
+         # ✅ 응답에서 '핵심 키워드: ' 부분 제거하여 임베딩에 사용하도록 함
+        keywords_text = response.content.replace("핵심 키워드: ", "").strip()
+        
+        # ✅ 벡터 검색용으로는 핵심 키워드 부분을 제거한 텍스트 사용
+        keywords_for_embedding = [keyword.strip() for keyword in keywords_text.split(",")]
+        combined_keywords = ", ".join(keywords_for_embedding)
+        
+        # ✅ AI 응답에서는 원본 텍스트(response.content)도 함께 사용할 수 있게 저장
+        keywords = {
+            "original_text": response.content,  # AI 응답용 원본 텍스트
+            "processed_keywords": combined_keywords  # 벡터 검색용 키워드 텍스트
+        }
+        
         redis_time = time.time() - redis_start
         logger.info(f"📊 LLM을 이용한 키워드 추출 시간: {redis_time:.4f} 초")
         
@@ -433,7 +449,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         # ✅ [Step 7] 엑셀 데이터 로드
         excel_start = time.time()
         try:
-            _, data = load_excel_to_texts("C:/Users/lso/Desktop/LimSunoh/chatbotAI/ai/db/ownerclan_narosu_오너클랜상품리스트_OWNERCLAN_250102 필요한 내용만.xlsx")
+            _, data = load_excel_to_texts("db/ownerclan_인기상품_1만개.xlsx")
 
         except Exception as e:
             raise ValueError(f"❌ [ERROR] 엑셀 데이터 로딩 실패: {e}")
@@ -445,13 +461,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         # ✅ [Step 8] OpenAI 임베딩 생성
         embedding_start = time.time()
         try:
-            임베딩 = OpenAIEmbeddings(model="text-embedding-ada-002", openai_api_key=API_KEY)
-            query_embedding = 임베딩.embed_query(combined_keywords)
-
-            if query_embedding is None or not isinstance(query_embedding, list):
-                raise ValueError(f"❌ [ERROR] 임베딩 생성 실패: {query_embedding}")
-
-            query_embedding = np.array([query_embedding], dtype=np.float32)
+            query_embedding = embed_texts_parallel([combined_keywords], EMBEDDING_MODEL)
             faiss.normalize_L2(query_embedding)
         except Exception as e:
             raise ValueError(f"❌ [ERROR] 임베딩 생성 실패: {e}")
@@ -705,12 +715,10 @@ def search_and_generate_response(request: QueryRequest):
         session_history.add_message(HumanMessage(content=query))
         print(f"�� Redis 메시지 기록 (변경된 상태): {session_history.messages}")
 
-        _, data = load_excel_to_texts("C:\\Users\\lso\\Desktop\\LimSunoh\\chatbotAI\\ai\\db\\ownerclan_narosu_오너클랜상품리스트_OWNERCLAN_250102 필요한 내용만.xlsx")
+        _, data = load_excel_to_texts("db/ownerclan_인기상품_1만개.xlsx")
 
         # ✅ OpenAI 임베딩 생성
-        임베딩 = OpenAIEmbeddings(model="text-embedding-ada-002", openai_api_key=API_KEY)
-        query_embedding = 임베딩.embed_query(combined_keywords)
-        query_embedding = np.array([query_embedding], dtype=np.float32)
+        query_embedding = embed_texts_parallel([combined_keywords], EMBEDDING_MODEL)
         faiss.normalize_L2(query_embedding)
 
         # ✅ FAISS 검색 수행(가장 가까운 상위 5개 벡터의 거리(D)와 인덱스(I)를 반환)
