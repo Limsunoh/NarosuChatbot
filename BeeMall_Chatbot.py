@@ -1,29 +1,31 @@
-from dotenv import load_dotenv
+import asyncio
+import logging
 import os
-import pandas as pd
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import Union
+
 import faiss
 import numpy as np
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
-import uvicorn
-from fastapi.middleware.cors import CORSMiddleware
-from langchain.schema import SystemMessage, HumanMessage, AIMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_community.chat_message_histories import RedisChatMessageHistory
+import pandas as pd
 import redis
 import requests
-from typing import Union
-import logging
-import time
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-
+import uvicorn
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from langchain.schema import AIMessage, HumanMessage, SystemMessage
+from langchain_community.chat_message_histories import (
+    ChatMessageHistory,
+    RedisChatMessageHistory,
+)
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from pydantic import BaseModel
 
 executor = ThreadPoolExecutor()
 
@@ -37,10 +39,11 @@ MANYCHAT_API_KEY = os.getenv('MANYCHAT_API_KEY')
 
 print(f"🔍 로드된 VERIFY_TOKEN: {VERIFY_TOKEN}")
 print(f"🔍 로드된 PAGE_ACCESS_TOKEN: {PAGE_ACCESS_TOKEN}")
-
+print(f"🔍 로드된 API_KEY: {API_KEY}")
 
 # ✅ FAISS 인덱스 파일 경로 설정
 faiss_file_path = f"faiss_index_02M.faiss"
+# 임베딩 모델 설정 변경필요성 있음
 
 def get_redis():
     return redis.Redis.from_url(REDIS_URL)
@@ -49,7 +52,7 @@ def get_redis():
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5050", "https://satyr-inviting-quetzal.ngrok-free.app"],  # 외부 도메인 추가
+    allow_origins=["http://localhost:5050", "https://satyr-inviting-quetzal.ngrok-free.app", "https://9525-58-75-40-178.ngrok-free.app/"],  # 외부 도메인 추가
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
@@ -140,6 +143,7 @@ def create_and_save_faiss_index(file_path):
         # ✅ IndexIVFFlat 사용
         d = embeddings.shape[1]
         nlist = 200  # 클러스터 개수
+        """클러스터 개수 조정할 가능성있음 (선오)"""
         quantizer = faiss.IndexFlatL2(d)
         index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
         index.train(embeddings)
@@ -151,17 +155,19 @@ def create_and_save_faiss_index(file_path):
 
 # ✅ FAISS 인덱스 로드 또는 생성
 if not os.path.exists(faiss_file_path):
-    create_and_save_faiss_index("db/ownerclan_narosu_오너클랜상품리스트_OWNERCLAN_250102 필요한 내용만.xlsx")
+    create_and_save_faiss_index("C:\\Users\\lso\\Desktop\\LimSunoh\\chatbotAI\\ai\\db\\ownerclan_narosu_오너클랜상품리스트_OWNERCLAN_250102 필요한 내용만.xlsx")
 index = load_faiss_index(faiss_file_path)
 
 # ✅ LLM을 이용한 키워드 추출 및 대화 이력 반영
 def extract_keywords_with_llm(query):
+    print(f"/n/n 키워드")
     try:
+        
         print(f"🔍 [extract_keywords_with_llm] 입력값: {query}")
 
         # ✅ Step 1: API 키 확인
         if "OPENAI_API_KEY" not in os.environ:
-            raise ValueError("❌ [ERROR] 환경 변수 OPENAI_API_KEY가 설정되지 않았습니다.")
+            raise ValueError("❌ [ERROR] {API_KEY} 환경 변수 OPENAI_API_KEY가 설정되지 않았습니다.")
         API_KEY = os.environ["OPENAI_API_KEY"]
         
         if not API_KEY or not isinstance(API_KEY, str):
@@ -181,7 +187,7 @@ def extract_keywords_with_llm(query):
 
         # 기존 대화 이력과 함께 LLM에 전달
         response = llm.invoke([
-            SystemMessage(content="사용자의 대화 내역을 반영하여 상품 검색을 위한 정말로 핵심 키워드를 추출해주세요. 만약 단어 간에 띄어쓰기가 있다면 하나의 단어 일수도 있습니다 띄어쓰기가 있다면 단어끼리 붙여서도 문장을 분석해보세요요. 여러방법으로 생각해서 추출해주세요. 다른 나라 언어로 질문이 들어오면 질문을 먼저 한글로 번역해서 단어를 추출합니다."),
+            SystemMessage(content="사용자의 대화 내역을 반영하여 상품 검색을 위한 정말로 핵심 키워드를 추출해주세요. 만약 단어 간에 띄어쓰기가 있다면 하나의 단어 일수도 있습니다 띄어쓰기가 있다면 단어끼리 붙여서도 문장을 분석해보세요. 여러방법으로 생각해서 추출해주세요. 다른 나라 언어로 질문이 들어오면 질문을 먼저 한글로 번역해서 단어를 추출합니다."),
             HumanMessage(content=f"질문: {query} \n ")
         ])
 
@@ -201,7 +207,7 @@ def extract_keywords_with_llm(query):
         keywords = [keyword.strip() for keyword in response.content.split(",")]
         combined_keywords = ", ".join(keywords)
         redis_time = time.time() - redis_start
-        logger.info(f"📊 LLM을 이용한 키워드 추출 시간간: {redis_time:.4f} 초")
+        logger.info(f"📊 LLM을 이용한 키워드 추출 시간: {redis_time:.4f} 초")
         
         if not combined_keywords:
             raise ValueError("❌ [ERROR] 키워드 추출 결과가 비어 있음.")
@@ -298,7 +304,7 @@ async def handle_webhook(request: Request):
                         "message": f"세션 {sender_id}의 대화 기록이 초기화되었습니다."
                     }
                 # ✅ AI 응답을 비동기적으로 처리 (별도로 실행)
-                asyncio.create_task(process_ai_response(sender_id, user_message))                
+                asyncio.create_task(process_ai_response(sender_id, user_message))
             
             process_time = time.time() - process_start
             logger.info(f"📊 [Processing Time 메시지 처리 전체 시간]: {process_time:.4f} 초")
@@ -398,7 +404,8 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         # ✅ [Step 7] 엑셀 데이터 로드
         excel_start = time.time()
         try:
-            _, data = load_excel_to_texts("db/속성39개정제_만개데이터.xlsx")
+            _, data = load_excel_to_texts("C:/Users/lso/Desktop/LimSunoh/chatbotAI/ai/db/ownerclan_narosu_오너클랜상품리스트_OWNERCLAN_250102 필요한 내용만.xlsx")
+
         except Exception as e:
             raise ValueError(f"❌ [ERROR] 엑셀 데이터 로딩 실패: {e}")
         
@@ -669,7 +676,7 @@ def search_and_generate_response(request: QueryRequest):
         session_history.add_message(HumanMessage(content=query))
         print(f"�� Redis 메시지 기록 (변경된 상태): {session_history.messages}")
 
-        _, data = load_excel_to_texts("db/ownerclan_narosu_오너클랜상품리스트_OWNERCLAN_250102 필요한 내용만.xlsx")
+        _, data = load_excel_to_texts("C:\\Users\\lso\\Desktop\\LimSunoh\\chatbotAI\\ai\\db\\ownerclan_narosu_오너클랜상품리스트_OWNERCLAN_250102 필요한 내용만.xlsx")
 
         # ✅ OpenAI 임베딩 생성
         임베딩 = OpenAIEmbeddings(model="text-embedding-ada-002", openai_api_key=API_KEY)
