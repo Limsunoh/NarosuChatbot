@@ -11,7 +11,6 @@ import pandas as pd
 import redis
 import requests
 import uvicorn
-import base64
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -71,8 +70,11 @@ async def measure_response_time(request: Request, call_next):
     start_time = time.time()  # 요청 시작 시간
     response = await call_next(request)  # 요청 처리
     process_time = time.time() - start_time  # 처리 시간 계산
+
     response.headers["ngrok-skip-browser-warning"] = "true"
-    
+    response.headers["X-Frame-Options"] = "ALLOWALL"  # 또는 제거 방식도 가능 #BeeMall 챗봇 Iframe 막히는것 때문에 헤더 추가가
+    response.headers["Content-Security-Policy"] = "frame-ancestors *" #BeeMall 챗봇 Iframe 막히는것 때문에 헤더 추가가
+
     # '/chatbot' 엔드포인트에 대한 응답 속도 로깅
     if request.url.path == "/webhook":
         print(f"📊 [TEST] Endpoint: {request.url.path}, 처리 시간: {process_time:.4f} 초")  # print로 직접 확인
@@ -453,7 +455,9 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         # ✅ [Step 7] 엑셀 데이터 로드
         excel_start = time.time()
         try:
+
             _, data = load_excel_to_texts("db/ownerclan_인기상품_1만개.xlsx")
+
 
         except Exception as e:
             raise ValueError(f"❌ [ERROR] 엑셀 데이터 로딩 실패: {e}")
@@ -841,3 +845,5 @@ def search_and_generate_response(request: QueryRequest):
 # ✅ FastAPI 서버 실행 (포트 고정: 5050)
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=5050)
+    
+    
