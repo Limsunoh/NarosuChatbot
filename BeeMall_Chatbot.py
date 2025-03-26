@@ -1,30 +1,32 @@
-from dotenv import load_dotenv
+import asyncio
+import logging
 import os
-import pandas as pd
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import Union
+
 import faiss
 import numpy as np
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
-import uvicorn
-from fastapi.middleware.cors import CORSMiddleware
-from langchain.schema import SystemMessage, HumanMessage, AIMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_community.chat_message_histories import RedisChatMessageHistory
+import pandas as pd
 import redis
 import requests
-from typing import Union
-import logging
-import time
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from fastapi.responses import Response
-import httpx
+import uvicorn
+import base64
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from langchain.schema import AIMessage, HumanMessage, SystemMessage
+from langchain_community.chat_message_histories import (
+    ChatMessageHistory,
+    RedisChatMessageHistory,
+)
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from pydantic import BaseModel
 
 executor = ThreadPoolExecutor()
 
@@ -38,10 +40,12 @@ MANYCHAT_API_KEY = os.getenv('MANYCHAT_API_KEY')
 
 print(f"🔍 로드된 VERIFY_TOKEN: {VERIFY_TOKEN}")
 print(f"🔍 로드된 PAGE_ACCESS_TOKEN: {PAGE_ACCESS_TOKEN}")
-
+print(f"🔍 로드된 API_KEY: {API_KEY}")
 
 # ✅ FAISS 인덱스 파일 경로 설정
-faiss_file_path = f"faiss_index_02M.faiss"
+faiss_file_path = f"03_25_faiss_index_3s.faiss"
+
+EMBEDDING_MODEL = "text-embedding-3-small"
 
 def get_redis():
     return redis.Redis.from_url(REDIS_URL)
@@ -50,7 +54,7 @@ def get_redis():
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5050", "https://satyr-inviting-quetzal.ngrok-free.app"],  # 외부 도메인 추가
+    allow_origins=["http://localhost:5050", "https://satyr-inviting-quetzal.ngrok-free.app", "https://9525-58-75-40-178.ngrok-free.app/", "https://viable-shark-faithful.ngrok-free.app"],  # 외부 도메인 추가
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
@@ -132,40 +136,79 @@ def load_faiss_index(file_path):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"FAISS 인덱스 로딩 오류: {str(e)}")
 
-# ✅ FAISS 인덱스 생성 및 저장 (IndexIVFFlat 적용 - 벡터를 여러 개의 클러스터(nlist 개수)로 그룹화한 후 검색할 때 일부 클러스터에서만 탐색하여 속도를 크게 향상)
+# ✅ 문서 임베딩 함수 (병렬 처리)
+def embed_texts_parallel(texts, embedding_model=EMBEDDING_MODEL, max_workers=8):
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            임베딩 = OpenAIEmbeddings(model=embedding_model, openai_api_key=API_KEY)
+            embeddings = list(executor.map(임베딩.embed_query, texts))
+        return np.array(embeddings, dtype=np.float32)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"임베딩 생성 오류: {str(e)}")
+
+# ✅ FAISS 인덱스 생성 및 저장 함수 (병렬 처리 적용)
 def create_and_save_faiss_index(file_path):
     try:
+        start_time = time.time()
+        
+        # 엑셀 파일 로드 및 변환
         texts, _ = load_excel_to_texts(file_path)
-        임베딩 = OpenAIEmbeddings(model="text-embedding-ada-002", openai_api_key=API_KEY)
-        embeddings = 임베딩.embed_documents(texts)
-        embeddings = np.array(embeddings, dtype=np.float32)
-        faiss.normalize_L2(embeddings)
+        print(f"📊 엑셀 파일 로드 및 변환 완료! ({len(texts)}개 텍스트)")
 
-        # ✅ IndexIVFFlat 사용
+        # 임베딩 생성 (병렬 처리 적용)
+        embeddings = embed_texts_parallel(texts, EMBEDDING_MODEL)
+        print(f"📊 임베딩 생성 완료!")
+        
+        # 임베딩 벡터의 개수와 각 벡터의 차원 출력
+        print(f"🔍🔍 임베딩 벡터 개수: {len(embeddings)}, 임베딩 차원: {embeddings.shape[1]}")
+        print(f"🔍🔍 임베딩 벡터 개수: {embeddings.shape[0]}")
+
+        # FAISS 인덱스 설정
+        faiss.normalize_L2(embeddings)
         d = embeddings.shape[1]
-        nlist = 200  # 클러스터 개수
+        nlist = min(200, len(texts) // 100)  # 클러스터 개수 설정 (데이터 개수에 비례)
         quantizer = faiss.IndexFlatL2(d)
         index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
+
+        # 인덱스 학습 및 추가
         index.train(embeddings)
         index.add(embeddings)
 
+        # 인덱스 저장
         save_faiss_index(index, faiss_file_path)
+
+        end_time = time.time()
+        print(f"✅ FAISS 인덱스 생성 및 저장 완료! (걸린 시간: {end_time - start_time:.2f} 초)")
+    
     except Exception as e:
         print(f"❌ FAISS 인덱스 생성 및 저장 오류: {e}")
 
-# ✅ FAISS 인덱스 로드 또는 생성
-if not os.path.exists(faiss_file_path):
-    create_and_save_faiss_index("db/ownerclan_narosu_오너클랜상품리스트_OWNERCLAN_250102 필요한 내용만.xlsx")
-index = load_faiss_index(faiss_file_path)
+# ✅ 인덱스 로드 또는 생성하기
+def initialize_faiss_index():
+    if not os.path.exists(faiss_file_path):
+        # 현재 디렉토리의 'db' 폴더 안에서 엑셀 파일을 검색
+        file_path = os.path.join(os.getcwd(), "db", "ownerclan_인기상품_1만개.xlsx")
+        
+        # 🔍 엑셀 데이터 로드 확인
+        texts, data = load_excel_to_texts(file_path)
+        print(data.head())  # 데이터의 첫 5개 행 출력 (엑셀 데이터 확인용)
+        
+        create_and_save_faiss_index(file_path)
+    index = load_faiss_index(faiss_file_path)
+    return index
+
+# ✅ 인덱스 초기화 실행
+index = initialize_faiss_index()
 
 # ✅ LLM을 이용한 키워드 추출 및 대화 이력 반영
 def extract_keywords_with_llm(query):
     try:
+        
         print(f"🔍 [extract_keywords_with_llm] 입력값: {query}")
 
         # ✅ Step 1: API 키 확인
         if "OPENAI_API_KEY" not in os.environ:
-            raise ValueError("❌ [ERROR] 환경 변수 OPENAI_API_KEY가 설정되지 않았습니다.")
+            raise ValueError("❌ [ERROR] {API_KEY} 환경 변수 OPENAI_API_KEY가 설정되지 않았습니다.")
         API_KEY = os.environ["OPENAI_API_KEY"]
         
         if not API_KEY or not isinstance(API_KEY, str):
@@ -185,7 +228,7 @@ def extract_keywords_with_llm(query):
 
         # 기존 대화 이력과 함께 LLM에 전달
         response = llm.invoke([
-            SystemMessage(content="사용자의 대화 내역을 반영하여 상품 검색을 위한 정말로 핵심 키워드를 추출해주세요. 만약 단어 간에 띄어쓰기가 있다면 하나의 단어 일수도 있습니다 띄어쓰기가 있다면 단어끼리 붙여서도 문장을 분석해보세요요. 여러방법으로 생각해서 추출해주세요. 다른 나라 언어로 질문이 들어오면 질문을 먼저 한글로 번역해서 단어를 추출합니다."),
+            SystemMessage(content="사용자의 대화 내역을 반영하여 상품 검색을 위한 핵심 키워드를 추출해주세요. 만약 단어 간에 띄어쓰기가 있다면 하나의 단어 일수도 있습니다 띄어쓰기가 있다면 단어끼리 붙여서도 문장을 분석해보세요. 여러방법,여러 방면으로 생각해서 추출해주세요. 다른 나라 언어로 질문이 들어오면 질문을 먼저 한글로 번역해서 단어를 추출합니다."),
             HumanMessage(content=f"질문: {query} \n ")
         ])
 
@@ -202,10 +245,21 @@ def extract_keywords_with_llm(query):
             raise ValueError(f"❌ [ERROR] LLM 응답이 비어 있거나 잘못된 데이터입니다: {response.content}")
 
         # 키워드 업데이트
-        keywords = [keyword.strip() for keyword in response.content.split(",")]
-        combined_keywords = ", ".join(keywords)
+         # ✅ 응답에서 '핵심 키워드: ' 부분 제거하여 임베딩에 사용하도록 함
+        keywords_text = response.content.replace("핵심 키워드:" , "").strip()
+        
+        # ✅ 벡터 검색용으로는 핵심 키워드 부분을 제거한 텍스트 사용
+        keywords_for_embedding = [keyword.strip() for keyword in keywords_text.split(",")]
+        combined_keywords = ", ".join(keywords_for_embedding)
+        
+        # ✅ AI 응답에서는 원본 텍스트(response.content)도 함께 사용할 수 있게 저장
+        keywords = {
+            "original_text": response.content,  # AI 응답용 원본 텍스트
+            "processed_keywords": combined_keywords  # 벡터 검색용 키워드 텍스트
+        }
+        
         redis_time = time.time() - redis_start
-        logger.info(f"📊 LLM을 이용한 키워드 추출 시간간: {redis_time:.4f} 초")
+        logger.info(f"📊 LLM을 이용한 키워드 추출 시간: {redis_time:.4f} 초")
         
         if not combined_keywords:
             raise ValueError("❌ [ERROR] 키워드 추출 결과가 비어 있음.")
@@ -302,7 +356,7 @@ async def handle_webhook(request: Request):
                         "message": f"세션 {sender_id}의 대화 기록이 초기화되었습니다."
                     }
                 # ✅ AI 응답을 비동기적으로 처리 (별도로 실행)
-                asyncio.create_task(process_ai_response(sender_id, user_message))                
+                asyncio.create_task(process_ai_response(sender_id, user_message))
             
             process_time = time.time() - process_start
             logger.info(f"📊 [Processing Time 메시지 처리 전체 시간]: {process_time:.4f} 초")
@@ -345,6 +399,19 @@ async def process_ai_response(sender_id: str, user_message: str):
 
 ################################################################
 # external_search_and_generate_response는 ManyChat 같은 외부 서비스와 연동되는 챗봇용 API이고, 구축된 UI 에는 사용되지 않음.
+
+def convert_image_to_base64(image_url):
+    try:
+        response = requests.get(image_url)
+        response.raise_for_status()  # 요청이 성공했는지 확인
+        image_data = response.content  # 이미지 파일의 바이너리 데이터
+
+        # 이미지를 Base64로 인코딩
+        encoded_image = base64.b64encode(image_data).decode('utf-8')
+        return encoded_image
+    except Exception as e:
+        print(f"❌ 이미지 변환 오류: {e}")
+        return None
 
 
 def external_search_and_generate_response(request: Union[QueryRequest, str], session_id: str = None) -> dict:  
@@ -402,7 +469,10 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         # ✅ [Step 7] 엑셀 데이터 로드
         excel_start = time.time()
         try:
-            _, data = load_excel_to_texts("db/ownerclan_narosu_오너클랜상품리스트_OWNERCLAN_250102 필요한 내용만.xlsx")
+
+            _, data = load_excel_to_texts("db/ownerclan_인기상품_1만개.xlsx")
+
+
         except Exception as e:
             raise ValueError(f"❌ [ERROR] 엑셀 데이터 로딩 실패: {e}")
         
@@ -413,13 +483,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         # ✅ [Step 8] OpenAI 임베딩 생성
         embedding_start = time.time()
         try:
-            임베딩 = OpenAIEmbeddings(model="text-embedding-ada-002", openai_api_key=API_KEY)
-            query_embedding = 임베딩.embed_query(combined_keywords)
-
-            if query_embedding is None or not isinstance(query_embedding, list):
-                raise ValueError(f"❌ [ERROR] 임베딩 생성 실패: {query_embedding}")
-
-            query_embedding = np.array([query_embedding], dtype=np.float32)
+            query_embedding = embed_texts_parallel([combined_keywords], EMBEDDING_MODEL)
             faiss.normalize_L2(query_embedding)
         except Exception as e:
             raise ValueError(f"❌ [ERROR] 임베딩 생성 실패: {e}")
@@ -538,6 +602,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         # ✅ 출력 디버깅
         print("*** Response:", response)
         print("*** Message History:", message_history)
+        print("✅✅✅✅*✅✅✅✅ Results:", results)
 
         # ✅ JSON 반환
         return {
@@ -673,12 +738,10 @@ def search_and_generate_response(request: QueryRequest):
         session_history.add_message(HumanMessage(content=query))
         print(f"�� Redis 메시지 기록 (변경된 상태): {session_history.messages}")
 
-        _, data = load_excel_to_texts("db/ownerclan_narosu_오너클랜상품리스트_OWNERCLAN_250102 필요한 내용만.xlsx")
+        _, data = load_excel_to_texts("db/ownerclan_인기상품_1만개.xlsx")
 
         # ✅ OpenAI 임베딩 생성
-        임베딩 = OpenAIEmbeddings(model="text-embedding-ada-002", openai_api_key=API_KEY)
-        query_embedding = 임베딩.embed_query(combined_keywords)
-        query_embedding = np.array([query_embedding], dtype=np.float32)
+        query_embedding = embed_texts_parallel([combined_keywords], EMBEDDING_MODEL)
         faiss.normalize_L2(query_embedding)
 
         # ✅ FAISS 검색 수행(가장 가까운 상위 5개 벡터의 거리(D)와 인덱스(I)를 반환)
@@ -705,12 +768,17 @@ def search_and_generate_response(request: QueryRequest):
                 if idx >= len(data):  # 잘못된 인덱스 방지
                     continue
                 result_row = data.iloc[idx]
+
+                # 이미지 URL을 Base64로 변환
+                image_url = result_row["이미지중"]
+                encoded_image = convert_image_to_base64(image_url)
+
                 result_info = {
                     "상품코드": str(result_row["상품코드"]),
                     "제목": result_row["원본상품명"],
                     "가격": convert_to_serializable(result_row["오너클랜판매가"]),
                     "배송비": convert_to_serializable(result_row["배송비"]),
-                    "이미지": result_row["이미지중"],
+                    "이미지": encoded_image if encoded_image else image_url,  # 변환 실패 시 URL로 전달
                     "원산지": result_row["원산지"]
                 }
                 results.append(result_info)
@@ -779,6 +847,7 @@ def search_and_generate_response(request: QueryRequest):
         # ✅ 출력 디버깅
         print("*** Response:", response)
         print("*** Message History:", message_history)
+        print("✅*✅*✅* Results:", results)
 
         # ✅ JSON 반환
         return {
