@@ -397,19 +397,6 @@ async def process_ai_response(sender_id: str, user_message: str):
 ################################################################
 # external_search_and_generate_response는 ManyChat 같은 외부 서비스와 연동되는 챗봇용 API이고, 구축된 UI 에는 사용되지 않음.
 
-def convert_image_to_base64(image_url):
-    try:
-        response = requests.get(image_url)
-        response.raise_for_status()  # 요청이 성공했는지 확인
-        image_data = response.content  # 이미지 파일의 바이너리 데이터
-
-        # 이미지를 Base64로 인코딩
-        encoded_image = base64.b64encode(image_data).decode('utf-8')
-        return encoded_image
-    except Exception as e:
-        print(f"❌ 이미지 변환 오류: {e}")
-        return None
-
 
 def external_search_and_generate_response(request: Union[QueryRequest, str], session_id: str = None) -> dict:  
     
@@ -763,17 +750,12 @@ def search_and_generate_response(request: QueryRequest):
                 if idx >= len(data):  # 잘못된 인덱스 방지
                     continue
                 result_row = data.iloc[idx]
-
-                # 이미지 URL을 Base64로 변환
-                image_url = result_row["이미지중"]
-                encoded_image = convert_image_to_base64(image_url)
-
                 result_info = {
                     "상품코드": str(result_row["상품코드"]),
                     "제목": result_row["원본상품명"],
                     "가격": convert_to_serializable(result_row["오너클랜판매가"]),
                     "배송비": convert_to_serializable(result_row["배송비"]),
-                    "이미지": encoded_image if encoded_image else image_url,  # 변환 실패 시 URL로 전달
+                    "이미지": result_row["이미지중"],
                     "원산지": result_row["원산지"]
                 }
                 results.append(result_info)
