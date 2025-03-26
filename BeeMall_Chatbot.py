@@ -11,6 +11,7 @@ import pandas as pd
 import redis
 import requests
 import uvicorn
+import base64
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,7 +43,7 @@ print(f"🔍 로드된 PAGE_ACCESS_TOKEN: {PAGE_ACCESS_TOKEN}")
 print(f"🔍 로드된 API_KEY: {API_KEY}")
 
 # ✅ FAISS 인덱스 파일 경로 설정
-faiss_file_path = f"03_24_faiss_index_3s.faiss"
+faiss_file_path = f"03_25_faiss_index_3s.faiss"
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 
@@ -53,7 +54,7 @@ def get_redis():
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5050", "https://satyr-inviting-quetzal.ngrok-free.app", "https://9525-58-75-40-178.ngrok-free.app/"],  # 외부 도메인 추가
+    allow_origins=["http://localhost:5050", "https://satyr-inviting-quetzal.ngrok-free.app", "https://9525-58-75-40-178.ngrok-free.app/", "https://viable-shark-faithful.ngrok-free.app"],  # 외부 도메인 추가
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
@@ -154,6 +155,10 @@ def create_and_save_faiss_index(file_path):
         # 임베딩 생성 (병렬 처리 적용)
         embeddings = embed_texts_parallel(texts, EMBEDDING_MODEL)
         print(f"📊 임베딩 생성 완료!")
+        
+        # 임베딩 벡터의 개수와 각 벡터의 차원 출력
+        print(f"🔍🔍 임베딩 벡터 개수: {len(embeddings)}, 임베딩 차원: {embeddings.shape[1]}")
+        print(f"🔍🔍 임베딩 벡터 개수: {embeddings.shape[0]}")
 
         # FAISS 인덱스 설정
         faiss.normalize_L2(embeddings)
@@ -194,7 +199,6 @@ index = initialize_faiss_index()
 
 # ✅ LLM을 이용한 키워드 추출 및 대화 이력 반영
 def extract_keywords_with_llm(query):
-    print(f"/n/n 키워드")
     try:
         
         print(f"🔍 [extract_keywords_with_llm] 입력값: {query}")
@@ -221,7 +225,7 @@ def extract_keywords_with_llm(query):
 
         # 기존 대화 이력과 함께 LLM에 전달
         response = llm.invoke([
-            SystemMessage(content="사용자의 대화 내역을 반영하여 상품 검색을 위한 핵심 키워드를 추출해주세요. 만약 단어 간에 띄어쓰기가 있다면 하나의 단어 일수도 있습니다 띄어쓰기가 있다면 단어끼리 붙여서도 문장을 분석해보세요. 여러방법,여러 방면면으로 생각해서 추출해주세요. 다른 나라 언어로 질문이 들어오면 질문을 먼저 한글로 번역해서 단어를 추출합니다."),
+            SystemMessage(content="사용자의 대화 내역을 반영하여 상품 검색을 위한 핵심 키워드를 추출해주세요. 만약 단어 간에 띄어쓰기가 있다면 하나의 단어 일수도 있습니다 띄어쓰기가 있다면 단어끼리 붙여서도 문장을 분석해보세요. 여러방법,여러 방면으로 생각해서 추출해주세요. 다른 나라 언어로 질문이 들어오면 질문을 먼저 한글로 번역해서 단어를 추출합니다."),
             HumanMessage(content=f"질문: {query} \n ")
         ])
 
@@ -239,7 +243,7 @@ def extract_keywords_with_llm(query):
 
         # 키워드 업데이트
          # ✅ 응답에서 '핵심 키워드: ' 부분 제거하여 임베딩에 사용하도록 함
-        keywords_text = response.content.replace("핵심 키워드: ", "").strip()
+        keywords_text = response.content.replace("핵심 키워드:" , "").strip()
         
         # ✅ 벡터 검색용으로는 핵심 키워드 부분을 제거한 텍스트 사용
         keywords_for_embedding = [keyword.strip() for keyword in keywords_text.split(",")]
@@ -392,6 +396,19 @@ async def process_ai_response(sender_id: str, user_message: str):
 
 ################################################################
 # external_search_and_generate_response는 ManyChat 같은 외부 서비스와 연동되는 챗봇용 API이고, 구축된 UI 에는 사용되지 않음.
+
+def convert_image_to_base64(image_url):
+    try:
+        response = requests.get(image_url)
+        response.raise_for_status()  # 요청이 성공했는지 확인
+        image_data = response.content  # 이미지 파일의 바이너리 데이터
+
+        # 이미지를 Base64로 인코딩
+        encoded_image = base64.b64encode(image_data).decode('utf-8')
+        return encoded_image
+    except Exception as e:
+        print(f"❌ 이미지 변환 오류: {e}")
+        return None
 
 
 def external_search_and_generate_response(request: Union[QueryRequest, str], session_id: str = None) -> dict:  
@@ -580,6 +597,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         # ✅ 출력 디버깅
         print("*** Response:", response)
         print("*** Message History:", message_history)
+        print("✅✅✅✅*✅✅✅✅ Results:", results)
 
         # ✅ JSON 반환
         return {
@@ -745,12 +763,17 @@ def search_and_generate_response(request: QueryRequest):
                 if idx >= len(data):  # 잘못된 인덱스 방지
                     continue
                 result_row = data.iloc[idx]
+
+                # 이미지 URL을 Base64로 변환
+                image_url = result_row["이미지중"]
+                encoded_image = convert_image_to_base64(image_url)
+
                 result_info = {
                     "상품코드": str(result_row["상품코드"]),
                     "제목": result_row["원본상품명"],
                     "가격": convert_to_serializable(result_row["오너클랜판매가"]),
                     "배송비": convert_to_serializable(result_row["배송비"]),
-                    "이미지": result_row["이미지중"],
+                    "이미지": encoded_image if encoded_image else image_url,  # 변환 실패 시 URL로 전달
                     "원산지": result_row["원산지"]
                 }
                 results.append(result_info)
@@ -819,6 +842,7 @@ def search_and_generate_response(request: QueryRequest):
         # ✅ 출력 디버깅
         print("*** Response:", response)
         print("*** Message History:", message_history)
+        print("✅*✅*✅* Results:", results)
 
         # ✅ JSON 반환
         return {
