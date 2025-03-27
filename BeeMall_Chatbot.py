@@ -390,6 +390,8 @@ async def process_ai_response(sender_id: str, user_message: str):
             response_text = bot_response["response"]
             send_message(sender_id, response_text)
             print(f"🤖 [AI 응답 전송 완료]: {response_text}")
+
+
         else:
             print(f"❌ AI 응답 오류 발생")
 
@@ -423,11 +425,11 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     if not isinstance(query, str):
         raise TypeError(f"❌ [ERROR] 잘못된 query 타입: {type(query)}")
 
-    # # ✅ [Step 2] Reset 요청 처리
-    # if query.lower() == "reset":
-    #     if session_id:
-    #         clear_message_history(session_id)
-    #     return {"message": f"세션 {session_id}의 대화 기록이 초기화되었습니다."}
+    # ✅ [Step 2] Reset 요청 처리
+    if query.lower() == "reset":
+        if session_id:
+            clear_message_history(session_id)
+        return {"message": f"세션 {session_id}의 대화 기록이 초기화되었습니다."}
     
     try:
         # ✅ [Step 3] Redis 메시지 기록 관리
@@ -682,10 +684,28 @@ def send_message(recipient_id: str, message_text: str):
     response = requests.post(url, headers=headers, json=data)
     if response.status_code == 200:
         print(f"✅ 메시지 전송 성공: {response.json()}")
+        set_custom_field(recipient_id,message_text)
+
     else:
         print(f"❌ 메시지 전송 실패: {response.status_code}, {response.text}")
 
+def set_custom_field(subscriber_id: str,field_value: str):
+    url = "https://api.manychat.com/fb/subscriber/setCustomField"
+    headers = {
+        "Authorization": f"Bearer {MANYCHAT_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "subscriber_id": subscriber_id,
+        "field_id": "12730710",
+        "field_value": field_value
+    }
 
+    response = requests.post(url, headers=headers, json=data)
+    if response.status_code == 200:
+        print(f"✅ Custom Field 저장 성공")
+    else:
+        print(f"❌ Custom Field 저장 실패: {response.status_code}, {response.text}")
 
 
 
