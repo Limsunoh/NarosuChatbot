@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 import os
 import time
@@ -11,7 +12,6 @@ import pandas as pd
 import redis
 import requests
 import uvicorn
-import base64
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -246,7 +246,7 @@ def extract_keywords_with_llm(query):
 
         # 키워드 업데이트
          # ✅ 응답에서 '핵심 키워드: ' 부분 제거하여 임베딩에 사용하도록 함
-        keywords_text = response.content.replace("핵심 키워드:" , "").strip()
+        keywords_text = response.content.replace("추출된 핵심 키워드:" , "").strip()
         
         # ✅ 벡터 검색용으로는 핵심 키워드 부분을 제거한 텍스트 사용
         keywords_for_embedding = [keyword.strip() for keyword in keywords_text.split(",")]
@@ -397,23 +397,11 @@ async def process_ai_response(sender_id: str, user_message: str):
         print(f"❌ AI 응답 처리 오류: {e}")
 
 
-################################################################
-# external_search_and_generate_response는 ManyChat 같은 외부 서비스와 연동되는 챗봇용 API이고, 구축된 UI 에는 사용되지 않음.
+'''####################################################################################################################
+external_search_and_generate_response는 ManyChat 같은 외부 서비스와 연동되는 챗봇용 API이고, 구축된 UI 에는 사용되지 않음.
+'''
 
-def convert_image_to_base64(image_url):
-    try:
-        response = requests.get(image_url)
-        response.raise_for_status()  # 요청이 성공했는지 확인
-        image_data = response.content  # 이미지 파일의 바이너리 데이터
-
-        # 이미지를 Base64로 인코딩
-        encoded_image = base64.b64encode(image_data).decode('utf-8')
-        return encoded_image
-    except Exception as e:
-        print(f"❌ 이미지 변환 오류: {e}")
-        return None
-
-
+# ✅ 외부 검색 및 응답 생성 함수
 def external_search_and_generate_response(request: Union[QueryRequest, str], session_id: str = None) -> dict:  
     
     # ✅ [Step 1] 요청 데이터 확인
@@ -423,11 +411,11 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     if not isinstance(query, str):
         raise TypeError(f"❌ [ERROR] 잘못된 query 타입: {type(query)}")
 
-    # # ✅ [Step 2] Reset 요청 처리
-    # if query.lower() == "reset":
-    #     if session_id:
-    #         clear_message_history(session_id)
-    #     return {"message": f"세션 {session_id}의 대화 기록이 초기화되었습니다."}
+    # ✅ [Step 2] Reset 요청 처리
+    if query.lower() == "reset":
+        if session_id:
+            clear_message_history(session_id)
+        return {"message": f"세션 {session_id}의 대화 기록이 초기화되었습니다."}
     
     try:
         # ✅ [Step 3] Redis 메시지 기록 관리
@@ -458,21 +446,18 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             raise ValueError(f"❌ [ERROR] 키워드 추출 실패: {combined_keywords}")
         
         print(f"🔍 [Step 4-2] combined_keywords: {combined_keywords}")
-
         print(f"✅ [Step 5] 생성된 검색 키워드: {combined_keywords}")
-        print(f"📊 [Step 5] LLM 키워드 추출 시간: {llm_time:.4f} 초")
+        print(f"📊 [Step 5-1] LLM 키워드 추출 시간: {llm_time:.4f} 초")
 
         # ✅ [Step 6] Redis에 사용자 입력 추가
         session_history.add_message(HumanMessage(content=query))
         print(f"🔍 [Step 6] Redis 메시지 기록 (변경된 상태): {session_history.messages}")
-
+        
         # ✅ [Step 7] 엑셀 데이터 로드
         excel_start = time.time()
+        
         try:
-
             _, data = load_excel_to_texts("db/ownerclan_인기상품_1만개.xlsx")
-
-
         except Exception as e:
             raise ValueError(f"❌ [ERROR] 엑셀 데이터 로딩 실패: {e}")
         
@@ -531,12 +516,16 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                         "가격": convert_to_serializable(result_row.get("오너클랜판매가", 0)),
                         "배송비": convert_to_serializable(result_row.get("배송비", 0)),
                         "이미지": result_row.get("이미지중", "이미지 없음"),
-                        "원산지": result_row.get("원산지", "정보 없음")
+                        "원산지": result_row.get("원산지", "정보 없음"),
+                        "상품링크": result_row.get("본문상세설명", "링크 없음"),
                     }
                     results.append(result_info)
                 except KeyError as e:
                     print(f"❌ [ERROR] KeyError: {e}")
                     continue
+                
+        if not results:
+            return {"query": query, "results": [], "message": "검색 결과가 없습니다."}
 
         # ✅ results를 텍스트로 변환
         if results:
@@ -549,8 +538,28 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             )
         else:
             results_text = "검색 결과가 없습니다."
-                
+            
         message_history=[]
+        
+        # ✅ 결과 중 첫 번째 제품 정보를 ManyChat으로 보내기 위해 정리
+        '''first_result = results[0]
+        product_data = {
+            "image_url": first_result["이미지"],
+            "title": first_result["제목"],
+            "price": f"{first_result['가격']}원",
+            "delivery_fee": f"{first_result['배송비']}원",
+            "origin": first_result["원산지"],
+            "product_url": first_result["상품링크"]
+        }
+
+        # ✅ ManyChat API로 메시지 보내기
+        send_message(session_id, product_data)'''
+        # ✅ 상위 5개 결과를 보냄
+        send_message(session_id, results[:5])
+        print(f"✅ [Step 11] 검색 결과: {results}")
+        print(f"✅ [Step 11] 검색 결과 텍스트: {results_text}")
+        
+        
 
         # ✅ [Step 12] LLM 기반 대화 응답 생성
         start_response = time.time()    
@@ -564,8 +573,8 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             대화 전략:자연스럽고 공감 있게 대화를 이어가며 사용자가 원하는 상품을 정확히 찾을 수 있도록 돕습니다.
             고객이 편안한 쇼핑 경험을 누릴 수 있도록 최선을 다합니다."""),
             MessagesPlaceholder(variable_name="message_history"),
-            ("system", f"다음은 대화이력입니다 : {session_history.messages}"),
-            ("system", f"다음은 상품결과입니다 : {results_text}"),
+            ("system", f"검색 결과입니다:\n {results_text}"),
+            ("system", f"이전 대화입니다:\n {message_history}"),
             ("human", query)
         ])
         
@@ -576,8 +585,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             input_messages_key="input",  # 입력 메시지의 키
             history_messages_key="message_history",
         )
-
-        
 
         # ✅ LLM 실행 및 메시지 기록 업데이트
         response = with_message_history.invoke(
@@ -603,6 +610,8 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         print("*** Response:", response)
         print("*** Message History:", message_history)
         print("✅✅✅✅*✅✅✅✅ Results:", results)
+        print(f"✅ [Before Send] Results Type: {type(results[:5])}")
+        print(f"✅ [Before Send] Results Content: {results[:5]}")
 
         # ✅ JSON 반환
         return {
@@ -611,6 +620,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             "response": response.content,
             "message_history": message_history
         }
+        
     
         # 전체 처리 시간 로깅
         total_time = time.time() - start_time
@@ -619,7 +629,87 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
     except Exception as e:
         print(f"❌ 오류 발생: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+# ✅ ManyChat API로 메시지 보내기
+# ManyChat API를 사용하여 Facebook 메시지를 보내는 함수입니다.
+def send_message(recipient_id: str, results: list):
     
+    print(f"✅ [Before Send] Results Type: {type(results[:5])}")
+    print(f"✅ [Before Send] Results Content: {results[:5]}")
+    """
+    ManyChat API를 사용하여 Facebook 메시지를 보내는 함수입니다.
+    results는 아래와 같은 형태의 딕셔너리여야 합니다.
+    {
+        "image_url": "https://example.com/image.jpg",
+        "title": "원본 상품명",
+        "price": "00,000원",
+        "delivery_fee": "0,000원",
+        "origin": "해외 | 아시아 | 중국",
+        "product_url": "https://example.com/product"
+    }
+    """
+    print(f"✅ SEND_message 들어갔다")
+
+    url = "https://api.manychat.com/fb/sending/sendContent"
+    headers = {
+        "Authorization": f"Bearer {MANYCHAT_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    # ✅ ManyChat로 보낼 메시지 데이터 구성
+    messages = []
+    for product in results:
+        messages.append({
+            "type": "image",
+            "url": product["이미지"]
+        })
+        messages.append({
+            "type": "text",
+            "text": f"✨ {product['제목']}\n\n가격: {product['가격']}원\n배송비: {product['배송비']}원\n원산지: {product['원산지']}\n",
+            "buttons": [
+                {
+                    "type": "url",
+                    "caption": "상품 보러가기",
+                    "url": product["상품링크"],
+                    "webview": "full"
+                },
+                {
+                    "type": "url",
+                    "caption": "구매하기",
+                    "url": product["상품링크"]
+                }
+            ]
+        })
+
+    data = {
+        "subscriber_id": recipient_id,
+        "data": {
+            "version": "v2",
+            "content": {
+                "messages": messages,
+                "actions": [],
+                "quick_replies": []
+            }
+        },
+        "message_tag": "ACCOUNT_UPDATE"
+    }
+    
+    # ManyChat API로 메시지 전송 요청하기
+    response = requests.post(url, headers=headers, json=data)
+    
+    if response.status_code == 200:
+        print(f"✅ 메시지 전송 성공: {response.json()}")
+    else:
+        print(f"❌ 메시지 전송 실패: {response.status_code}, {response.text}")
+
+
+
+# ✅ 루트 경로 - HTML 페이지 렌더링
+@app.get("/", response_class=HTMLResponse)
+async def serve_home(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
 
 
 def generate_bot_response(user_message: str) -> str:
@@ -657,43 +747,6 @@ def generate_bot_response(user_message: str) -> str:
     except Exception as e:
         print(f"❌ 응답 생성 오류: {e}")
         return "죄송합니다. 오류가 발생했습니다. 나중에 다시 시도해주세요."
-
-def send_message(recipient_id: str, message_text: str):
-    print(f"✅ SEND_message 들어갔다")
-
-    url = "https://api.manychat.com/fb/sending/sendContent"
-    headers = {
-        "Authorization": f"Bearer {MANYCHAT_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "subscriber_id": recipient_id,
-        "data": {
-            "version": "v2",
-            "content": {
-                "messages": [
-                    {"type": "text",
-                     "text": message_text}
-                ]
-            }
-        },
-        "message_tag": "ACCOUNT_UPDATE"
-    }
-    response = requests.post(url, headers=headers, json=data)
-    if response.status_code == 200:
-        print(f"✅ 메시지 전송 성공: {response.json()}")
-    else:
-        print(f"❌ 메시지 전송 실패: {response.status_code}, {response.text}")
-
-
-
-
-
-# ✅ 루트 경로 - HTML 페이지 렌더링
-@app.get("/", response_class=HTMLResponse)
-async def serve_home(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
-
 
 
 # ✅ POST 요청 처리 - `/chatbot`
@@ -771,14 +824,13 @@ def search_and_generate_response(request: QueryRequest):
 
                 # 이미지 URL을 Base64로 변환
                 image_url = result_row["이미지중"]
-                encoded_image = convert_image_to_base64(image_url)
 
                 result_info = {
                     "상품코드": str(result_row["상품코드"]),
                     "제목": result_row["원본상품명"],
                     "가격": convert_to_serializable(result_row["오너클랜판매가"]),
                     "배송비": convert_to_serializable(result_row["배송비"]),
-                    "이미지": encoded_image if encoded_image else image_url,  # 변환 실패 시 URL로 전달
+                    "이미지": image_url,
                     "원산지": result_row["원산지"]
                 }
                 results.append(result_info)
