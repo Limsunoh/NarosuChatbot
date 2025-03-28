@@ -12,6 +12,7 @@ import pandas as pd
 import redis
 import requests
 import uvicorn
+import json
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,7 +55,9 @@ def get_redis():
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5050", "https://satyr-inviting-quetzal.ngrok-free.app", "https://9525-58-75-40-178.ngrok-free.app/", "https://viable-shark-faithful.ngrok-free.app"],  # 외부 도메인 추가
+    allow_origins=["http://localhost:5050",
+                   "https://satyr-inviting-quetzal.ngrok-free.app", 
+                   "https://viable-shark-faithful.ngrok-free.app"],  # 외부 도메인 추가
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
@@ -385,11 +388,41 @@ async def process_ai_response(sender_id: str, user_message: str):
         loop = asyncio.get_running_loop()
         bot_response = await loop.run_in_executor(executor, external_search_and_generate_response, user_message, sender_id)
 
-        # 응답 확인 후 ManyChat API로 최종 메시지 전송
-        if isinstance(bot_response, dict) and "response" in bot_response:
-            response_text = bot_response["response"]
-            send_message(sender_id, response_text)
-            print(f"🤖 [AI 응답 전송 완료]: {response_text}")
+        # ✅ 응답 확인 및 전송 처리
+        if isinstance(bot_response, dict):
+            combined_message_text = bot_response.get("combined_message_text", "")
+            results = bot_response.get("results", [])
+
+            # ✅ 전송할 메시지 데이터 목록 (이제 리스트가 아님)
+            messages_data = []
+
+            # ✅ AI 응답 메시지 추가 (combined_message_text가 있을 경우에만)
+            if combined_message_text:
+                messages_data.append({
+                    "type": "text",
+                    "text": combined_message_text
+                })
+
+            # ✅ 상품 정보들을 딕셔너리로 추가
+            for product in results:
+                if product.get("이미지"):
+                    messages_data.append({
+                        "type": "image",
+                        "url": product["이미지"]
+                    })
+                messages_data.append({
+                    "type": "text",
+                    "text": f"✨ {product['제목']}\n\n가격: {product['가격']}원\n배송비: {product['배송비']}원\n원산지: {product['원산지']}\n",
+                    "buttons": [
+                        {"type": "url", "caption": "상품 보러가기", "url": product.get("상품링크", "#"), "webview": "full"},
+                        {"type": "url", "caption": "구매하기", "url": product.get("상품링크", "#")}
+                    ]
+                })
+
+            # ✅ send_message()에 원시 데이터 리스트를 넘김
+            send_message(sender_id, messages_data)
+            print(f"✅ [Combined 메시지 전송 완료]: {combined_message_text}")
+
         else:
             print(f"❌ AI 응답 오류 발생")
 
@@ -541,26 +574,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             
         message_history=[]
         
-        # ✅ 결과 중 첫 번째 제품 정보를 ManyChat으로 보내기 위해 정리
-        '''first_result = results[0]
-        product_data = {
-            "image_url": first_result["이미지"],
-            "title": first_result["제목"],
-            "price": f"{first_result['가격']}원",
-            "delivery_fee": f"{first_result['배송비']}원",
-            "origin": first_result["원산지"],
-            "product_url": first_result["상품링크"]
-        }
-
-        # ✅ ManyChat API로 메시지 보내기
-        send_message(session_id, product_data)'''
-        # ✅ 상위 5개 결과를 보냄
-        send_message(session_id, results[:5])
-        print(f"✅ [Step 11] 검색 결과: {results}")
-        print(f"✅ [Step 11] 검색 결과 텍스트: {results_text}")
-        
-        
-
         # ✅ [Step 12] LLM 기반 대화 응답 생성
         start_response = time.time()    
         # ✅ ChatPromptTemplate 및 RunnableWithMessageHistory 생성
@@ -613,11 +626,15 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         print(f"✅ [Before Send] Results Type: {type(results[:5])}")
         print(f"✅ [Before Send] Results Content: {results[:5]}")
 
+        # ✅ Combined Message 만들기 (검색 결과 + LLM 응답)
+        combined_message_text = f"{results_text}\n\n🤖 AI 답변: {response.content}"
+        print(f"🔍 [Step 12-1] Combined Message: {combined_message_text}")
+        
         # ✅ JSON 반환
         return {
             "query": query,
             "results": results,
-            "response": response.content,
+            "combined_message_text": combined_message_text,
             "message_history": message_history
         }
         
@@ -632,77 +649,95 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
 
 
-# ✅ ManyChat API로 메시지 보내기
-# ManyChat API를 사용하여 Facebook 메시지를 보내는 함수입니다.
-def send_message(recipient_id: str, results: list):
-    
-    print(f"✅ [Before Send] Results Type: {type(results[:5])}")
-    print(f"✅ [Before Send] Results Content: {results[:5]}")
-    """
-    ManyChat API를 사용하여 Facebook 메시지를 보내는 함수입니다.
-    results는 아래와 같은 형태의 딕셔너리여야 합니다.
-    {
-        "image_url": "https://example.com/image.jpg",
-        "title": "원본 상품명",
-        "price": "00,000원",
-        "delivery_fee": "0,000원",
-        "origin": "해외 | 아시아 | 중국",
-        "product_url": "https://example.com/product"
-    }
-    """
-    print(f"✅ SEND_message 들어갔다")
+import json  # 추가된 부분
 
-    url = "https://api.manychat.com/fb/sending/sendContent"
-    headers = {
-        "Authorization": f"Bearer {MANYCHAT_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    # ✅ ManyChat로 보낼 메시지 데이터 구성
-    messages = []
-    for product in results:
-        messages.append({
-            "type": "image",
-            "url": product["이미지"]
-        })
-        messages.append({
+def send_message(sender_id: str, messages: list):  
+    try:  
+        # ✅ ManyChat API URL 및 헤더 설정
+        url = "https://api.manychat.com/fb/sending/sendContent"
+        headers = {
+            "Authorization": f"Bearer {MANYCHAT_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        # ✅ 전송 데이터 검증
+        if not isinstance(messages, list):
+            print(f"❌ [ERROR] messages는 리스트여야 합니다. 전달된 타입: {type(messages)}")
+            return
+        
+        # ✅ 보낼 데이터 형식 확인
+        print(f"✅ [Before Send] Messages Content: {messages}")
+
+        # ✅ URL 값 확인 후 변경
+        for message in messages:
+            if message.get("buttons"):
+                for button in message["buttons"]:
+                    if button["url"] in ["링크 없음", "#", None, ""]:
+                        button["url"] = "https://naver.com"  # 예시 URL로 변경
+                        
+        # ✅ ManyChat API로 보낼 데이터 구성
+        # Step 1: LLM 응답 메시지를 먼저 보내기
+        llm_message = {
             "type": "text",
-            "text": f"✨ {product['제목']}\n\n가격: {product['가격']}원\n배송비: {product['배송비']}원\n원산지: {product['원산지']}\n",
-            "buttons": [
-                {
-                    "type": "url",
-                    "caption": "상품 보러가기",
-                    "url": product["상품링크"],
-                    "webview": "full"
-                },
-                {
-                    "type": "url",
-                    "caption": "구매하기",
-                    "url": product["상품링크"]
-                }
-            ]
-        })
+            "text": messages[0]['text']  # LLM 응답 메시지
+        }
 
-    data = {
-        "subscriber_id": recipient_id,
-        "data": {
-            "version": "v2",
-            "content": {
-                "messages": messages,
-                "actions": [],
-                "quick_replies": []
+        # ✅ 보낼 데이터 구성 (ManyChat 형식에 맞게)
+        data = {
+            "subscriber_id": sender_id,
+            "data": {
+                "version": "v2",
+                "content": {
+                    "messages": [llm_message],  # 먼저 LLM 응답 메시지를 보냄
+                    "actions": [],
+                    "quick_replies": []
+                }
+            },
+            "message_tag": "ACCOUNT_UPDATE"
+        }
+        
+        # ✅ LLM 응답 메시지 보내기
+        response = requests.post(url, headers=headers, json=data)
+        if response.status_code == 200:
+            print(f"✅ [ManyChat LLM 메시지 전송 성공]: {response.json()}")
+        else:
+            print(f"❌ [ManyChat LLM 메시지 전송 실패] 상태 코드: {response.status_code}, 오류 내용: {response.text}")
+
+        # Step 2: 상품 정보 메시지들 보내기
+        for message in messages[4:]:
+            data = {
+                "subscriber_id": sender_id,
+                "data": {
+                    "version": "v2",
+                    "content": {
+                        "messages": [message],  # 개별 상품 메시지
+                        "actions": [],
+                        "quick_replies": []
+                    }
+                },
+                "message_tag": "ACCOUNT_UPDATE"
             }
-        },
-        "message_tag": "ACCOUNT_UPDATE"
-    }
+
+            # ✅ JSON 데이터 직렬화 검사
+            try:
+                json_string = json.dumps(data)  # JSON 직렬화 테스트
+                print(f"✅ JSON 직렬화 성공: {json_string[:500]}...")  # 처음 500자만 출력
+            except Exception as e:
+                print(f"❌ [JSON Error] JSON 데이터 직렬화 오류: {e}")
+                continue  # 문제 발생 시 해당 메시지 건너뛰기
+            
+            # ✅ ManyChat API로 개별 상품 메시지 전송
+            response = requests.post(url, headers=headers, json=data)
+            
+            if response.status_code == 200:
+                print(f"✅ [ManyChat 개별 메시지 전송 성공]: {response.json()}")
+            else:
+                print(f"❌ [ManyChat 메시지 전송 실패] 상태 코드: {response.status_code}, 오류 내용: {response.text}")
     
-    # ManyChat API로 메시지 전송 요청하기
-    response = requests.post(url, headers=headers, json=data)
-    
-    if response.status_code == 200:
-        print(f"✅ 메시지 전송 성공: {response.json()}")
-    else:
-        print(f"❌ 메시지 전송 실패: {response.status_code}, {response.text}")
+    except Exception as e:
+        print(f"❌ ManyChat 메시지 전송 오류: {e}")
+
+
 
 
 
