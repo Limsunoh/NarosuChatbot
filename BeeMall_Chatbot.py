@@ -579,15 +579,29 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         # ✅ ChatPromptTemplate 및 RunnableWithMessageHistory 생성
         llm = ChatOpenAI(model="gpt-4o-mini", openai_api_key=API_KEY)
         prompt = ChatPromptTemplate.from_messages([
-            ("system", """당신은 쇼핑몰 챗봇으로, 친절하고 인간적인 대화를 통해 고객의 쇼핑 경험을 돕습니다.
-            목표: 사용자의 요구를 이해하고 대화의 맥락을 반영하여 적합한 상품을 추천합니다.
-            작동 방식:대화 이력을 참고해 문맥을 파악하고 사용자의 요청에 맞는 상품을 연결합니다.
-            필요한 경우 후속 질문으로 사용자의 요구를 구체화합니다.
-            대화 전략:자연스럽고 공감 있게 대화를 이어가며 사용자가 원하는 상품을 정확히 찾을 수 있도록 돕습니다.
-            고객이 편안한 쇼핑 경험을 누릴 수 있도록 최선을 다합니다."""),
+            ("system", """
+        당신은 쇼핑몰 챗봇으로, 친절하고 인간적인 대화를 통해 고객의 쇼핑 경험을 돕습니다.
+
+        🎯 목표:
+        - 사용자의 요구를 이해하고 대화의 맥락을 반영하여 적합한 상품을 추천합니다.
+
+        ⚙️ 작동 방식:
+        - 대화 이력을 참고해 문맥을 파악하고 사용자의 요청에 맞는 상품을 연결합니다.
+        - 필요한 경우 후속 질문으로 사용자의 요구를 구체화합니다.
+
+        📌 주의사항:
+        - 아래 검색 결과는 LLM 내부 참고용입니다.
+        - 상품을 나열하거나 직접 출력하지 마세요.
+        - 키워드 요약이나 후속 질문을 위한 참고용으로만 활용하세요.
+        """),
+
             MessagesPlaceholder(variable_name="message_history"),
-            ("system", f"검색 결과입니다:\n {results_text}"),
-            ("system", f"이전 대화입니다:\n {message_history}"),
+
+            ("system", f"[검색 결과 - 내부 참고용 JSON]\n{json.dumps(results[:5], ensure_ascii=False).replace('{', '{{').replace('}', '}}')}"),
+
+
+            ("system", f"[이전 대화 내용]\n{message_history}"),
+
             ("human", query)
         ])
         
@@ -627,7 +641,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         print(f"✅ [Before Send] Results Content: {results[:5]}")
 
         # ✅ Combined Message 만들기 (검색 결과 + LLM 응답)
-        combined_message_text = f"{results_text}\n\n🤖 AI 답변: {response.content}"
+        combined_message_text = f"🤖 AI 답변: {response.content}"
         print(f"🔍 [Step 12-1] Combined Message: {combined_message_text}")
         
         # ✅ JSON 반환
@@ -647,9 +661,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         print(f"❌ 오류 발생: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
-
-import json  # 추가된 부분
 
 def send_message(sender_id: str, messages: list):  
     try:  
@@ -704,7 +715,7 @@ def send_message(sender_id: str, messages: list):
             print(f"❌ [ManyChat LLM 메시지 전송 실패] 상태 코드: {response.status_code}, 오류 내용: {response.text}")
 
         # Step 2: 상품 정보 메시지들 보내기
-        for message in messages[4:]:
+        for message in messages[1:]:
             data = {
                 "subscriber_id": sender_id,
                 "data": {
