@@ -13,6 +13,7 @@ import redis
 import requests
 import uvicorn
 import base64
+import urllib
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -439,6 +440,19 @@ async def process_ai_response(sender_id: str, user_message: str):
     except Exception as e:
         print(f"❌ AI 응답 처리 오류: {e}")
 
+def clean_html_content(html_raw: str) -> str:
+    try:
+        html_cleaned = html_raw.replace('\n', '').replace('\r', '')
+        html_cleaned = html_cleaned.replace("“", "\"").replace("”", "\"").replace("‘", "'").replace("’", "'")
+        if html_cleaned.count("<center>") > html_cleaned.count("</center>"):
+            html_cleaned += "</center>"
+        if html_cleaned.count("<p") > html_cleaned.count("</p>"):
+            html_cleaned += "</p>"
+        return html_cleaned
+    except Exception as e:
+        print(f"❌ HTML 정제 오류: {e}")
+        return html_raw
+
 
 '''####################################################################################################################
 external_search_and_generate_response는 ManyChat 같은 외부 서비스와 연동되는 챗봇용 API이고, 구축된 UI 에는 사용되지 않음.
@@ -552,10 +566,23 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 try:
                     result_row = data.iloc[idx]
 
-                    # ✅ 상품상세설명 -> base64 인코딩
-                    detail_html = result_row.get("본문상세설명", "")
-                    detail_encoded = base64.b64encode(detail_html.encode("utf-8")).decode("utf-8")
-                    preview_url = f"https://viable-shark-faithful.ngrok-free.app/preview?html={detail_encoded}"
+                    # ✅ 상품상세설명 -> base64 인코딩 (디코딩 에러 방지)
+                    html_raw = result_row.get("본문상세설명", "") or ""
+                    html_cleaned = clean_html_content(html_raw)
+
+                    try:
+                        if isinstance(html_raw, bytes):
+                            html_raw = html_raw.decode("cp949")  # 혹시 바이너리 형태일 경우 디코딩
+                    except Exception as e:
+                        print(f"⚠️ [본문 디코딩 경고] cp949 디코딩 실패: {e}")
+
+                    try:
+                        encoded_html = base64.b64encode(html_cleaned.encode("utf-8", errors="ignore")).decode("utf-8")
+                        safe_html = urllib.parse.quote_plus(encoded_html)
+                        preview_url = f"https://viable-shark-faithful.ngrok-free.app/preview?html={safe_html}"
+                    except Exception as e:
+                        print(f"❌ [본문 인코딩 실패] {e}")
+                        preview_url = "https://naver.com"
 
                     # ✅ 상품링크가 비어있다면 preview_url 사용
                     product_link = result_row.get("상품링크", "")
@@ -575,7 +602,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                 except KeyError as e:
                     print(f"❌ [ERROR] KeyError: {e}")
                 continue
-                
+
         if not results:
             return {"query": query, "results": [], "message": "검색 결과가 없습니다."}
 
