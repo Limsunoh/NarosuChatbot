@@ -1,5 +1,5 @@
 import asyncio
-import base64
+import json
 import logging
 import os
 import time
@@ -12,9 +12,10 @@ import pandas as pd
 import redis
 import requests
 import uvicorn
-import json
+import base64
+
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
@@ -44,7 +45,7 @@ print(f"🔍 로드된 PAGE_ACCESS_TOKEN: {PAGE_ACCESS_TOKEN}")
 print(f"🔍 로드된 API_KEY: {API_KEY}")
 
 # ✅ FAISS 인덱스 파일 경로 설정
-faiss_file_path = f"03_25_faiss_index_3s.faiss"
+faiss_file_path = f"04_03_faiss_3s.faiss"
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 
@@ -90,7 +91,7 @@ async def measure_response_time(request: Request, call_next):
 # ✅ Jinja2 템플릿 설정
 templates = Jinja2Templates(directory="templates")
 
-# ✅ Redis 기반 메시지 기록 관리 함수
+'''# ✅ Redis 기반 메시지 기록 관리 함수
 def get_message_history(session_id: str) -> RedisChatMessageHistory:
     """
     Redis를 사용하여 메시지 기록을 관리합니다.
@@ -102,7 +103,7 @@ def get_message_history(session_id: str) -> RedisChatMessageHistory:
         return history
     except Exception as e:
         print(f"❌ Redis 연결 오류: {e}")
-        raise HTTPException(status_code=500, detail="Redis 연결에 문제가 발생했습니다.")
+        raise HTTPException(status_code=500, detail="Redis 연결에 문제가 발생했습니다.")'''
 
 # 요청 모델
 class QueryRequest(BaseModel):
@@ -115,13 +116,20 @@ def convert_to_serializable(obj):
         return obj.item()
     return obj
 
-# ✅ 엑셀 데이터 로드 및 변환 (공백 제거)
+# ✅ 엑셀 데이터 로드 및 변환 (본문상세설명 컬럼 제외하고 임베딩용 텍스트 생성)
 def load_excel_to_texts(file_path):
     try:
         data = pd.read_excel(file_path)
         data.columns = data.columns.str.strip()
-        texts = [" | ".join([f"{col}: {row[col]}" for col in data.columns]) for _, row in data.iterrows()]
-        return texts, data
+
+        # 임베딩용 데이터프레임에서 '본문상세설명' 제외
+        if '본문상세설명' in data.columns:
+            embedding_df = data.drop(columns=['본문상세설명'])
+        else:
+            embedding_df = data
+
+        texts = [" | ".join([f"{col}: {row[col]}" for col in embedding_df.columns]) for _, row in embedding_df.iterrows()]
+        return texts, data  # 원본 데이터(data)는 본문상세설명 포함
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"엑셀 파일 로드 오류: {str(e)}")
 
@@ -162,6 +170,10 @@ def create_and_save_faiss_index(file_path):
         embeddings = embed_texts_parallel(texts, EMBEDDING_MODEL)
         print(f"📊 임베딩 생성 완료!")
         
+        # ✅ 예시 텍스트 1줄 출력해서 본문상세설명 포함 여부 확인
+        print("🔎 임베딩 대상 텍스트 예시 1줄:")
+        print(texts[0])  # 본문상세설명 포함 여부 확인용
+        
         # 임베딩 벡터의 개수와 각 벡터의 차원 출력
         print(f"🔍🔍 임베딩 벡터 개수: {len(embeddings)}, 임베딩 차원: {embeddings.shape[1]}")
         print(f"🔍🔍 임베딩 벡터 개수: {embeddings.shape[0]}")
@@ -185,16 +197,18 @@ def create_and_save_faiss_index(file_path):
     
     except Exception as e:
         print(f"❌ FAISS 인덱스 생성 및 저장 오류: {e}")
+    
 
 # ✅ 인덱스 로드 또는 생성하기
 def initialize_faiss_index():
     if not os.path.exists(faiss_file_path):
         # 현재 디렉토리의 'db' 폴더 안에서 엑셀 파일을 검색
-        file_path = os.path.join(os.getcwd(), "db", "ownerclan_인기상품_1만개.xlsx")
+        file_path = os.path.join(os.getcwd(), "db", "ownerclan_주간인기상품_5만개.xlsx")
         
         # 🔍 엑셀 데이터 로드 확인
         texts, data = load_excel_to_texts(file_path)
         print(data.head())  # 데이터의 첫 5개 행 출력 (엑셀 데이터 확인용)
+        print(texts[0])  # 텍스트의 첫 번째 항목 출력 
         
         create_and_save_faiss_index(file_path)
     index = load_faiss_index(faiss_file_path)
@@ -274,13 +288,8 @@ def extract_keywords_with_llm(query):
         print(f"❌ [ERROR] extract_keywords_with_llm 실행 중 오류 발생: {e}")
         raise
 
-store = {}  # 빈 딕셔너리를 초기화합니다.
 def get_session_history(session_id: str) -> BaseChatMessageHistory:
-    # 세션 ID에 해당하는 대화 기록이 저장소에 없으면 새로운 ChatMessageHistory를 생성합니다.
-    if session_id not in store:
-        store[session_id] = ChatMessageHistory()
-    # 세션 ID에 해당하는 대화 기록을 반환합니다.
-    return store[session_id]
+    return RedisChatMessageHistory(session_id=session_id, url=REDIS_URL)
 
 def clear_message_history(session_id: str):
     """
@@ -320,7 +329,7 @@ async def verify_webhook(request: Request):
         return {"status": "error", "message": str(e)}
     
 @app.post("/webhook")
-async def handle_webhook(request: Request):
+async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
     start_time = time.time()
 
     try:
@@ -359,7 +368,7 @@ async def handle_webhook(request: Request):
                         "message": f"세션 {sender_id}의 대화 기록이 초기화되었습니다."
                     }
                 # ✅ AI 응답을 비동기적으로 처리 (별도로 실행)
-                asyncio.create_task(process_ai_response(sender_id, user_message))
+                background_tasks.add_task(process_ai_response, sender_id, user_message)
             
             process_time = time.time() - process_start
             logger.info(f"📊 [Processing Time 메시지 처리 전체 시간]: {process_time:.4f} 초")
@@ -380,6 +389,7 @@ async def handle_webhook(request: Request):
     except Exception as e:
         print(f"❌ 웹훅 처리 오류: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    
 async def process_ai_response(sender_id: str, user_message: str):
     try:
         print(f"🕒 [AI 처리 시작] 유저 ID: {sender_id}, 메시지: {user_message}")
@@ -436,67 +446,65 @@ external_search_and_generate_response는 ManyChat 같은 외부 서비스와 연
 
 # ✅ 외부 검색 및 응답 생성 함수
 def external_search_and_generate_response(request: Union[QueryRequest, str], session_id: str = None) -> dict:  
-    
+
     # ✅ [Step 1] 요청 데이터 확인
     query = request
     print(f"🔍 사용자 검색어: {query}")
 
     if not isinstance(query, str):
         raise TypeError(f"❌ [ERROR] 잘못된 query 타입: {type(query)}")
+    
 
     # ✅ [Step 2] Reset 요청 처리
     if query.lower() == "reset":
         if session_id:
             clear_message_history(session_id)
         return {"message": f"세션 {session_id}의 대화 기록이 초기화되었습니다."}
-    
+
     try:
-        # ✅ [Step 3] Redis 메시지 기록 관리
+        # ✅ Step 3: Redis 기록 불러오기
         redis_start = time.time()
-        session_history = get_message_history(session_id)
+        session_history = get_session_history(session_id)
         redis_time = time.time() - redis_start
         print(f"📊 [Step 3] Redis 메시지 기록 관리 시간: {redis_time:.4f} 초")
 
-        # ✅ [Step 4] 기존 대화 내역 확인
+        # ✅ [Step 4~5] 최신 메시지 기록 다시 불러오기
         previous_queries = [msg.content for msg in session_history.messages if isinstance(msg, HumanMessage)]
-        print(f"🔍 [Step 4] Redis 기존 대화 내역: {previous_queries}")
+        # ✅ 현재 입력값이 이전 대화에 이미 있다면 제거 (중복 방지)
+        if query in previous_queries:
+            previous_queries.remove(query)
+        print(f"🔁 [Step 5] 최신 Redis 대화 내역: {previous_queries}")
+        
+        print("🔍 [DEBUG] Redis 메시지 저장 순서 확인:")
+        for i, msg in enumerate(session_history.messages):
+            print(f"{i+1}번째 ▶️ {type(msg).__name__} | 내용: {msg.content}")
 
-        # ✅ [Step 5] LLM 키워드 추출
+        # ✅ [Step 6] LLM 키워드 추출
         llm_start = time.time()
         combined_query = " ".join(previous_queries + [query])
-        print(f"🔍 [Step 4-1]combined_query: {combined_query}")
+        print(f"🔍 [Step 6-1] combined_query: {combined_query}")
 
-        # ✅ extract_keywords_with_llm 실행 전 확인
         if not combined_query or not isinstance(combined_query, str):
             raise ValueError(f"❌ [ERROR] combined_query가 올바른 문자열이 아닙니다: {combined_query} (타입: {type(combined_query)})")
 
-
         combined_keywords = extract_keywords_with_llm(combined_query)
-
         llm_time = time.time() - llm_start
 
         if not combined_keywords or not isinstance(combined_keywords, str):
             raise ValueError(f"❌ [ERROR] 키워드 추출 실패: {combined_keywords}")
-        
-        print(f"🔍 [Step 4-2] combined_keywords: {combined_keywords}")
-        print(f"✅ [Step 5] 생성된 검색 키워드: {combined_keywords}")
-        print(f"📊 [Step 5-1] LLM 키워드 추출 시간: {llm_time:.4f} 초")
 
-        # ✅ [Step 6] Redis에 사용자 입력 추가
-        session_history.add_message(HumanMessage(content=query))
-        print(f"🔍 [Step 6] Redis 메시지 기록 (변경된 상태): {session_history.messages}")
-        
+        print(f"🔍 [Step 6-2] combined_keywords: {combined_keywords}")
+        print(f"📊 [Step 6-3] LLM 키워드 추출 시간: {llm_time:.4f} 초")
+
         # ✅ [Step 7] 엑셀 데이터 로드
         excel_start = time.time()
-        
         try:
-            _, data = load_excel_to_texts("db/ownerclan_인기상품_1만개.xlsx")
+            _, data = load_excel_to_texts("db/ownerclan_주간인기상품_5만개.xlsx")
         except Exception as e:
             raise ValueError(f"❌ [ERROR] 엑셀 데이터 로딩 실패: {e}")
-        
+
         excel_time = time.time() - excel_start
         print(f"📊 [Step 7] 엑셀 데이터 로드 시간: {excel_time:.4f} 초")
-
 
         # ✅ [Step 8] OpenAI 임베딩 생성
         embedding_start = time.time()
@@ -543,19 +551,30 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
                 try:
                     result_row = data.iloc[idx]
+
+                    # ✅ 상품상세설명 -> base64 인코딩
+                    detail_html = result_row.get("본문상세설명", "")
+                    detail_encoded = base64.b64encode(detail_html.encode("utf-8")).decode("utf-8")
+                    preview_url = f"https://viable-shark-faithful.ngrok-free.app/preview?html={detail_encoded}"
+
+                    # ✅ 상품링크가 비어있다면 preview_url 사용
+                    product_link = result_row.get("상품링크", "")
+                    if not product_link or product_link in ["링크 없음", "#", None]:
+                        product_link = preview_url
+
                     result_info = {
                         "상품코드": str(result_row.get("상품코드", "없음")),
-                        "제목": result_row.get("원본상품명", "제목 없음"),
-                        "가격": convert_to_serializable(result_row.get("오너클랜판매가", 0)),
+                        "제목": result_row.get("마켓상품명", "제목 없음"),
+                        "가격": convert_to_serializable(result_row.get("마켓실제판매가", 0)),
                         "배송비": convert_to_serializable(result_row.get("배송비", 0)),
                         "이미지": result_row.get("이미지중", "이미지 없음"),
                         "원산지": result_row.get("원산지", "정보 없음"),
-                        "상품링크": result_row.get("본문상세설명", "링크 없음"),
+                        "상품링크": product_link,
                     }
                     results.append(result_info)
                 except KeyError as e:
                     print(f"❌ [ERROR] KeyError: {e}")
-                    continue
+                continue
                 
         if not results:
             return {"query": query, "results": [], "message": "검색 결과가 없습니다."}
@@ -622,11 +641,8 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         response_time = time.time() - start_response
         print(f"📊 [Step 12] LLM 응답 생성 시간: {response_time:.4f} 초")
 
-        # ✅ Redis에 AI 응답 추가
-        session_history.add_message(AIMessage(content=response.content))
-
         # ✅ 메시지 기록을 Redis에서 가져오기
-        session_history = get_message_history(session_id)
+        session_history = get_session_history(session_id)
         message_history = [
             {"type": type(msg).__name__, "content": msg.content if hasattr(msg, "content") else str(msg)}
             for msg in session_history.messages
@@ -635,10 +651,10 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
         # ✅ 출력 디버깅
         print("*** Response:", response)
-        print("*** Message History:", message_history)
+        #print("*** Message History:", message_history)
         print("✅✅✅✅*✅✅✅✅ Results:", results)
-        print(f"✅ [Before Send] Results Type: {type(results[:5])}")
-        print(f"✅ [Before Send] Results Content: {results[:5]}")
+        #print(f"✅ [Before Send] Results Type: {type(results[:5])}")
+        #print(f"✅ [Before Send] Results Content: {results[:5]}")
 
         # ✅ Combined Message 만들기 (검색 결과 + LLM 응답)
         combined_message_text = f"🤖 AI 답변: {response.content}"
@@ -677,7 +693,7 @@ def send_message(sender_id: str, messages: list):
             return
         
         # ✅ 보낼 데이터 형식 확인
-        print(f"✅ [Before Send] Messages Content: {messages}")
+        #print(f"✅ [Before Send] Messages Content: {messages}")
 
         # ✅ URL 값 확인 후 변경
         for message in messages:
@@ -709,10 +725,10 @@ def send_message(sender_id: str, messages: list):
         
         # ✅ LLM 응답 메시지 보내기
         response = requests.post(url, headers=headers, json=data)
-        if response.status_code == 200:
-            print(f"✅ [ManyChat LLM 메시지 전송 성공]: {response.json()}")
+        '''if response.status_code == 200:
+            print(f"✅ [ManyChat LLM 메시지 전송 성공] : {response.json()}")
         else:
-            print(f"❌ [ManyChat LLM 메시지 전송 실패] 상태 코드: {response.status_code}, 오류 내용: {response.text}")
+            print(f"❌ [ManyChat LLM 메시지 전송 실패] 상태 코드: {response.status_code}, 오류 내용: {response.text}")'''
 
         # Step 2: 상품 정보 메시지들 보내기
         for message in messages[1:]:
@@ -732,7 +748,7 @@ def send_message(sender_id: str, messages: list):
             # ✅ JSON 데이터 직렬화 검사
             try:
                 json_string = json.dumps(data)  # JSON 직렬화 테스트
-                print(f"✅ JSON 직렬화 성공: {json_string[:500]}...")  # 처음 500자만 출력
+                # print(f"✅ JSON 직렬화 성공: {json_string[:500]}...")  # 처음 500자만 출력
             except Exception as e:
                 print(f"❌ [JSON Error] JSON 데이터 직렬화 오류: {e}")
                 continue  # 문제 발생 시 해당 메시지 건너뛰기
@@ -740,10 +756,10 @@ def send_message(sender_id: str, messages: list):
             # ✅ ManyChat API로 개별 상품 메시지 전송
             response = requests.post(url, headers=headers, json=data)
             
-            if response.status_code == 200:
+            '''if response.status_code == 200:
                 print(f"✅ [ManyChat 개별 메시지 전송 성공]: {response.json()}")
             else:
-                print(f"❌ [ManyChat 메시지 전송 실패] 상태 코드: {response.status_code}, 오류 내용: {response.text}")
+                print(f"❌ [ManyChat 메시지 전송 실패] 상태 코드: {response.status_code}, 오류 내용: {response.text}")'''
     
     except Exception as e:
         print(f"❌ ManyChat 메시지 전송 오류: {e}")
@@ -758,6 +774,40 @@ async def serve_home(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 
+@app.get("/preview", response_class=HTMLResponse)
+async def product_preview(html: str):
+    try:
+        decoded_html = base64.b64decode(html).decode("utf-8")
+        return f"""
+        <!DOCTYPE html>
+        <html lang="ko">
+        <head>
+            <meta charset="UTF-8">
+            <title>상품 상세 페이지</title>
+            <style>
+                body {{
+                    font-family: '맑은 고딕', sans-serif;
+                    padding: 20px;
+                    max-width: 800px;
+                    margin: auto;
+                    line-height: 1.5;
+                }}
+                img {{
+                    max-width: 100%;
+                    height: auto;
+                    display: block;
+                    margin: 20px auto;
+                }}
+            </style>
+        </head>
+        <body>
+            {decoded_html}
+        </body>
+        </html>
+        """
+    except Exception as e:
+        return HTMLResponse(content=f"<h1>오류 발생</h1><p>{e}</p>", status_code=400)
+
 def generate_bot_response(user_message: str) -> str:
     """
     사용자의 메시지를 받아 챗봇 응답을 생성합니다.
@@ -765,7 +815,7 @@ def generate_bot_response(user_message: str) -> str:
     try:
         # ✅ Redis를 이용한 세션 관리
         session_id = f"user_{user_message[:10]}"  # 간단한 세션 ID 생성 (필요 시 사용자 ID 사용)
-        session_history = get_message_history(session_id)
+        session_history = get_session_history(session_id)
 
         # ✅ Redis에서 기존 대화 이력 확인
         print(f"🔍 Redis 메시지 기록 (초기 상태): {session_history.messages}")
@@ -818,7 +868,7 @@ def search_and_generate_response(request: QueryRequest):
 
     try:
         # ✅ Redis 메시지 기록 관리
-        session_history = get_message_history(session_id)
+        session_history = get_session_history(session_id)
         # ✅ 기존 대화 내역 확인
         print(f"🔍 Redis 메시지 기록 (초기 상태): {session_history.messages}")
 
@@ -837,7 +887,7 @@ def search_and_generate_response(request: QueryRequest):
         session_history.add_message(HumanMessage(content=query))
         print(f"�� Redis 메시지 기록 (변경된 상태): {session_history.messages}")
 
-        _, data = load_excel_to_texts("db/ownerclan_인기상품_1만개.xlsx")
+        _, data = load_excel_to_texts("db/ownerclan_주간인기상품_5만개.xlsx")
 
         # ✅ OpenAI 임베딩 생성
         query_embedding = embed_texts_parallel([combined_keywords], EMBEDDING_MODEL)
