@@ -15,10 +15,11 @@ import uvicorn
 import base64
 import urllib
 
+from urllib.parse import quote
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from langchain.schema import AIMessage, HumanMessage, SystemMessage
 from langchain_community.chat_message_histories import (
@@ -345,6 +346,12 @@ def clear_message_history(session_id: str):
         raise HTTPException(status_code=500, detail="대화 기록 초기화 중 오류가 발생했습니다.")
 
 
+# 🔥 상품 캐시 (전역 선언)
+PRODUCT_CACHE = {}
+# 🔗 구매하기 버튼 클릭 시 호출되는 ManyChat용 Hook 주소
+MANYCHAT_HOOK_BASE_URL = "https://viable-shark-faithful.ngrok-free.app/product-select"
+
+
 @app.get("/webhook")
 async def verify_webhook(request: Request):
     try:
@@ -364,7 +371,8 @@ async def verify_webhook(request: Request):
     except Exception as e:
         print(f"❌ 인증 처리 오류: {e}")
         return {"status": "error", "message": str(e)}
-    
+
+
 @app.post("/webhook")
 async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
     start_time = time.time()
@@ -426,47 +434,74 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
     except Exception as e:
         print(f"❌ 웹훅 처리 오류: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-    
+
+
+# 🔁 추천 응답 처리 함수
 async def process_ai_response(sender_id: str, user_message: str):
     try:
         print(f"🕒 [AI 처리 시작] 유저 ID: {sender_id}, 메시지: {user_message}")
 
-        # AI 응답 생성 (비동기 처리)
+        # ✅ 외부 응답 생성 (동기 → 비동기 실행)
         loop = asyncio.get_running_loop()
         bot_response = await loop.run_in_executor(executor, external_search_and_generate_response, user_message, sender_id)
 
-        # ✅ 응답 확인 및 전송 처리
+        # ✅ 응답 확인 및 메시지 준비
         if isinstance(bot_response, dict):
             combined_message_text = bot_response.get("combined_message_text", "")
             results = bot_response.get("results", [])
 
-            # ✅ 전송할 메시지 데이터 목록 (이제 리스트가 아님)
+            # ✅ 상품 캐시에 저장 (product_code → 상품 딕셔너리 전체 저장)
+            for product in results:
+                product_code = product.get("상품코드")
+                if product_code:
+                    PRODUCT_CACHE[product_code] = product
+
             messages_data = []
 
-            # ✅ AI 응답 메시지 추가 (combined_message_text가 있을 경우에만)
+            # ✅ AI 응답 메시지 먼저 추가
             if combined_message_text:
                 messages_data.append({
                     "type": "text",
                     "text": combined_message_text
                 })
 
-            # ✅ 상품 정보들을 딕셔너리로 추가
+            # ✅ 각 상품 메시지 구성
             for product in results:
+                product_code = product.get("상품코드", "None")
+
+                # ✅ 이미지 메시지
                 if product.get("이미지"):
                     messages_data.append({
                         "type": "image",
                         "url": product["이미지"]
                     })
+
+                # ✅ 텍스트 메시지 + 버튼
                 messages_data.append({
                     "type": "text",
-                    "text": f"✨ {product['제목']}\n\n가격: {product['가격']}원\n배송비: {product['배송비']}원\n원산지: {product['원산지']}\n",
+                    "text": (
+                        f"✨ {product['제목']}\n\n"
+                        f"가격: {product['가격']}원\n"
+                        f"배송비: {product['배송비']}원\n"
+                        f"원산지: {product['원산지']}\n"
+                    ),
                     "buttons": [
-                        {"type": "url", "caption": "상품 보러가기", "url": product.get("상품링크", "#"), "webview": "full"},
-                        {"type": "url", "caption": "구매하기", "url": product.get("상품링크", "#")}
+                        {
+                            "type": "url",
+                            "caption": "상품 보러가기",
+                            "url": product.get("상품링크", "#"),
+                            "webview": "full"
+                        },
+                        {
+                            "type": "url",
+                            "caption": "구매하기",
+                            "url": f"{MANYCHAT_HOOK_BASE_URL}?sender_id={sender_id}&product_code={product_code}"
+                            
+                        }
                     ]
                 })
 
-            # ✅ send_message()에 원시 데이터 리스트를 넘김
+            # ✅ 메시지 전송
             send_message(sender_id, messages_data)
             print(f"✅ [Combined 메시지 전송 완료]: {combined_message_text}")
 
@@ -821,14 +856,79 @@ def send_message(sender_id: str, messages: list):
             # ✅ ManyChat API로 개별 상품 메시지 전송
             response = requests.post(url, headers=headers, json=data)
             
-            '''if response.status_code == 200:
+            if response.status_code == 200:
                 print(f"✅ [ManyChat 개별 메시지 전송 성공]: {response.json()}")
+                set_custom_field(sender_id,messages)
             else:
-                print(f"❌ [ManyChat 메시지 전송 실패] 상태 코드: {response.status_code}, 오류 내용: {response.text}")'''
+                print(f"❌ [ManyChat 메시지 전송 실패] 상태 코드: {response.status_code}, 오류 내용: {response.text}")
     
     except Exception as e:
         print(f"❌ ManyChat 메시지 전송 오류: {e}")
 
+
+def set_custom_field(subscriber_id: str, field_value: str):
+    url = "https://api.manychat.com/fb/subscriber/setCustomField"
+    headers = {
+        "Authorization": f"Bearer {MANYCHAT_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "subscriber_id": subscriber_id,
+        "field_id": "12730710",
+        "field_value": field_value
+    }
+    response = requests.post(url, headers=headers, json=data)
+    if response.status_code == 200:
+        print(f":흰색_확인_표시: Custom Field 저장 성공")
+    else:
+        print(f":x: Custom Field 저장 실패: {response.status_code}, {response.text}")
+
+
+@app.get("/product-select")
+async def handle_product_selection(sender_id: str, product_code: str):
+    try:
+        product = PRODUCT_CACHE.get(product_code)
+
+        if not product:
+            return {
+                "status": "error",
+                "message": f"상품코드 {product_code}에 대한 정보가 없습니다."
+            }
+
+        # 🔧 메시지 내용 생성 (같이 ManyChat에 보낼 텍스트)
+        info = (
+            f"✅ 선택하신 상품 정보입니다!\n"
+            f"상품코드: {product.get('상품코드')}\n"
+            f"제목: {product.get('제목')}\n"
+            f"가격: {product.get('가격')}원\n"
+            f"배송비: {product.get('배송비')}원\n"
+            f"원산지: {product.get('원산지')}\n"
+            f"옵션:\n{product.get('옵션')}"
+        )
+
+        # ✅ Custom Field 저장
+        set_custom_field(sender_id, info)
+
+        # ✅ 메시지 전송용 데이터 구성
+        messages_data = [
+            {
+                "type": "text",
+                "text": info
+            }
+        ]
+
+        # ✅ ManyChat으로 메시지 전송
+        send_message(sender_id, messages_data)
+
+        return {
+            "status": "success",
+            "message": "상품 정보 전송 및 저장 완료",
+            "saved_info": info
+        }
+
+    except Exception as e:
+        print(f"❌ 상품 선택 처리 오류: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 
@@ -873,6 +973,13 @@ async def product_preview(html: str):
     except Exception as e:
         return HTMLResponse(content=f"<h1>오류 발생</h1><p>{e}</p>", status_code=400)
 
+
+
+
+
+'''
+#######################################################################################################################
+
 def generate_bot_response(user_message: str) -> str:
     """
     사용자의 메시지를 받아 챗봇 응답을 생성합니다.
@@ -911,7 +1018,6 @@ def generate_bot_response(user_message: str) -> str:
 
 
 # ✅ POST 요청 처리 - `/chatbot`
-################################################################
 # search_and_generate_response는 UI 디자인이 된 웹 UI와 연결된 API 기본적인 API 요청을 통해 JSON 형태의 데이터를 주고 받음.
 
 @app.post("/chatbot")
@@ -1050,7 +1156,7 @@ def search_and_generate_response(request: QueryRequest):
         session_history.add_message(AIMessage(content=response.content))
 
         # ✅ 메시지 기록을 Redis에서 가져오기
-        session_history = get_message_history(session_id)
+        session_history = get_session_history(session_id)
         message_history = [
             {"type": type(msg).__name__, "content": msg.content if hasattr(msg, "content") else str(msg)}
             for msg in session_history.messages
@@ -1073,9 +1179,8 @@ def search_and_generate_response(request: QueryRequest):
     except Exception as e:
         print(f"❌ 오류 발생: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+        '''
 
 # ✅ FastAPI 서버 실행 (포트 고정: 5050)
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=5050)
-    
-    
