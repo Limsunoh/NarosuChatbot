@@ -19,7 +19,7 @@ from urllib.parse import quote
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from langchain.schema import AIMessage, HumanMessage, SystemMessage
 from langchain_community.chat_message_histories import (
@@ -378,62 +378,70 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
     start_time = time.time()
 
     try:
-        # Step 1: 요청 데이터 로드
+        # ✅ Step 1: 요청 데이터 파싱
         data = await request.json()
         parse_time = time.time() - start_time
         logger.info(f"📊 [Parse Time]: {parse_time:.4f} 초")
 
-        # Step 2: 메시지 처리
+        # ✅ Step 2: 메시지 처리 시작
         process_start = time.time()
 
-        if data.get("field") == "messages":  # field 값이 'messages'인지 확인
-            value = data.get("value", {})  # value 필드 가져오기
+        if data.get("field") == "messages":
+            value = data.get("value", {})
 
-            # Redis 세션 ID 설정
-            sender_id = value.get("sender", {}).get("id")  # 발신자 ID
-            # print(f"유저아이디 : {sender_id}")
+            sender_id = value.get("sender", {}).get("id")
+            user_message = value.get("message", {}).get("text", "").strip()
+            postback = value.get("postback", {})
 
-            # 사용자 메시지 가져오기
-            user_message = value.get("message", {}).get("text", "").strip()  # 메시지 텍스트
-            # print(f"유저메세지 : {user_message}")
+            # ✅ postback 처리
+            postback_payload = postback.get("payload")
+            if postback_payload and postback_payload.startswith("BUY::"):
+                product_code = postback_payload.split("::")[1]
+                background_tasks.add_task(handle_product_selection, sender_id, product_code)
+                return {
+                    "version": "v2",
+                    "content": {
+                        "messages": [
+                            {"type": "text", "text": f"✅ 상품 {product_code} 정보가 전송되었습니다!"}
+                        ]
+                    }
+                }
+
+            # ✅ reset 처리
             if sender_id and user_message:
                 if user_message.lower() == "reset":
                     print(f"🔄 [RESET] 세션 {sender_id}의 대화 기록 초기화!")
-                    clear_message_history(sender_id)  # Redis 대화 기록 초기화
+                    clear_message_history(sender_id)
                     return {
                         "version": "v2",
                         "content": {
                             "messages": [
-                                {
-                                    "type": "text",
-                                    "text": f"✅ 세션 {sender_id}의 대화 기록이 초기화되었습니다!"
-                                }
+                                {"type": "text", "text": f"✅ 세션 {sender_id}의 대화 기록이 초기화되었습니다!"}
                             ]
                         },
                         "message": f"세션 {sender_id}의 대화 기록이 초기화되었습니다."
                     }
-                # ✅ AI 응답을 비동기적으로 처리 (별도로 실행)
+
+                # ✅ 일반 메시지 → AI 응답 처리
                 background_tasks.add_task(process_ai_response, sender_id, user_message)
-            
+
             process_time = time.time() - process_start
-            logger.info(f"📊 [Processing Time 메시지 처리 전체 시간]: {process_time:.4f} 초")
-        print(data)
+            logger.info(f"📊 [Processing Time 전체]: {process_time:.4f} 초")
+
+        # 기본 응답
         return {
             "version": "v2",
-
             "content": {
                 "messages": [
-                    {
-                        "type": "text",
-                        "text": "입력이 완료 되어 AI가 생각중입니다.."
-                    }
+                    {"type": "text", "text": "입력이 완료 되어 AI가 생각중입니다.."}
                 ]
             }
-        }    
-    
+        }
+
     except Exception as e:
         print(f"❌ 웹훅 처리 오류: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 # 🔁 추천 응답 처리 함수
@@ -493,9 +501,9 @@ async def process_ai_response(sender_id: str, user_message: str):
                             "webview": "full"
                         },
                         {
-                            "type": "url",
-                            "caption": "구매하기",
-                            "url": f"{MANYCHAT_HOOK_BASE_URL}?sender_id={sender_id}&product_code={product_code}"
+                            "type": "postback",
+                            "title": "구매하기",
+                            "payload": f"BUY::{product_code}"
                             
                         }
                     ]
@@ -752,9 +760,9 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         # ✅ 출력 디버깅
         print("*** Response:", response)
         #print("*** Message History:", message_history)
-        print("✅✅✅✅*✅✅✅✅ Results:", results)
-        #print(f"✅ [Before Send] Results Type: {type(results[:5])}")
-        #print(f"✅ [Before Send] Results Content: {results[:5]}")
+        #print("✅✅✅✅*✅✅✅✅ Results:", results)
+        print(f"✅ [Before Send] Results Type: {type(results[:5])}")
+        print(f"✅ [Before Send] Results Content: {results[:5]}")
 
         # ✅ Combined Message 만들기 (검색 결과 + LLM 응답)
         combined_message_text = f"🤖 AI 답변: {response.content}"
@@ -799,9 +807,10 @@ def send_message(sender_id: str, messages: list):
         for message in messages:
             if message.get("buttons"):
                 for button in message["buttons"]:
-                    if button["url"] in ["링크 없음", "#", None, ""]:
-                        button["url"] = "https://naver.com"  # 예시 URL로 변경
-                        
+                    if button.get("type") == "url":
+                        if button.get("url") in ["링크 없음", "#", None, ""]:
+                            button["url"] = "https://naver.com"
+                            
         # ✅ ManyChat API로 보낼 데이터 구성
         # Step 1: LLM 응답 메시지를 먼저 보내기
         llm_message = {
@@ -884,18 +893,22 @@ def set_custom_field(subscriber_id: str, field_value: str):
         print(f":x: Custom Field 저장 실패: {response.status_code}, {response.text}")
 
 
-@app.get("/product-select")
+@app.post("/product-select")
 async def handle_product_selection(sender_id: str, product_code: str):
+    """
+    구매하기 버튼 클릭 시 호출되는 핸들러 (웹/포스트백 공통)
+    상품 정보를 Messenger에 전송하고, Custom Field에 저장함
+    """
     try:
         product = PRODUCT_CACHE.get(product_code)
 
         if not product:
             return {
                 "status": "error",
-                "message": f"상품코드 {product_code}에 대한 정보가 없습니다."
+                "message": f"❌ 상품코드 '{product_code}'에 대한 정보가 없습니다."
             }
 
-        # 🔧 메시지 내용 생성 (같이 ManyChat에 보낼 텍스트)
+        # ✅ 메시지 내용 생성
         info = (
             f"✅ 선택하신 상품 정보입니다!\n"
             f"상품코드: {product.get('상품코드')}\n"
@@ -909,16 +922,9 @@ async def handle_product_selection(sender_id: str, product_code: str):
         # ✅ Custom Field 저장
         set_custom_field(sender_id, info)
 
-        # ✅ 메시지 전송용 데이터 구성
-        messages_data = [
-            {
-                "type": "text",
-                "text": info
-            }
-        ]
-
-        # ✅ ManyChat으로 메시지 전송
-        send_message(sender_id, messages_data)
+        # ✅ Messenger 메시지 전송
+        await send_message(sender_id, [{"type": "text", "text": info}])
+        print(f"✅ Messenger에 상품 정보 전송 완료 (상품코드: {product_code})")
 
         return {
             "status": "success",
