@@ -1,5 +1,5 @@
 import asyncio
-import base64
+import json
 import logging
 import os
 import time
@@ -12,11 +12,14 @@ import pandas as pd
 import redis
 import requests
 import uvicorn
-import json
+import base64
+import urllib
+
+from urllib.parse import quote
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from langchain.schema import AIMessage, HumanMessage, SystemMessage
 from langchain_community.chat_message_histories import (
@@ -44,7 +47,7 @@ print(f"🔍 로드된 PAGE_ACCESS_TOKEN: {PAGE_ACCESS_TOKEN}")
 print(f"🔍 로드된 API_KEY: {API_KEY}")
 
 # ✅ FAISS 인덱스 파일 경로 설정
-faiss_file_path = f"03_25_faiss_index_3s.faiss"
+faiss_file_path = f"04_03_faiss_3s.faiss"
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 
@@ -90,7 +93,7 @@ async def measure_response_time(request: Request, call_next):
 # ✅ Jinja2 템플릿 설정
 templates = Jinja2Templates(directory="templates")
 
-# ✅ Redis 기반 메시지 기록 관리 함수
+'''# ✅ Redis 기반 메시지 기록 관리 함수
 def get_message_history(session_id: str) -> RedisChatMessageHistory:
     """
     Redis를 사용하여 메시지 기록을 관리합니다.
@@ -102,7 +105,7 @@ def get_message_history(session_id: str) -> RedisChatMessageHistory:
         return history
     except Exception as e:
         print(f"❌ Redis 연결 오류: {e}")
-        raise HTTPException(status_code=500, detail="Redis 연결에 문제가 발생했습니다.")
+        raise HTTPException(status_code=500, detail="Redis 연결에 문제가 발생했습니다.")'''
 
 # 요청 모델
 class QueryRequest(BaseModel):
@@ -115,13 +118,20 @@ def convert_to_serializable(obj):
         return obj.item()
     return obj
 
-# ✅ 엑셀 데이터 로드 및 변환 (공백 제거)
+# ✅ 엑셀 데이터 로드 및 변환 (본문상세설명 컬럼 제외하고 임베딩용 텍스트 생성)
 def load_excel_to_texts(file_path):
     try:
         data = pd.read_excel(file_path)
         data.columns = data.columns.str.strip()
-        texts = [" | ".join([f"{col}: {row[col]}" for col in data.columns]) for _, row in data.iterrows()]
-        return texts, data
+
+        # 임베딩용 데이터프레임에서 '본문상세설명' 제외
+        if '본문상세설명' in data.columns:
+            embedding_df = data.drop(columns=['본문상세설명'])
+        else:
+            embedding_df = data
+
+        texts = [" | ".join([f"{col}: {row[col]}" for col in embedding_df.columns]) for _, row in embedding_df.iterrows()]
+        return texts, data  # 원본 데이터(data)는 본문상세설명 포함
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"엑셀 파일 로드 오류: {str(e)}")
 
@@ -162,6 +172,10 @@ def create_and_save_faiss_index(file_path):
         embeddings = embed_texts_parallel(texts, EMBEDDING_MODEL)
         print(f"📊 임베딩 생성 완료!")
         
+        # ✅ 예시 텍스트 1줄 출력해서 본문상세설명 포함 여부 확인
+        print("🔎 임베딩 대상 텍스트 예시 1줄:")
+        print(texts[0])  # 본문상세설명 포함 여부 확인용
+        
         # 임베딩 벡터의 개수와 각 벡터의 차원 출력
         print(f"🔍🔍 임베딩 벡터 개수: {len(embeddings)}, 임베딩 차원: {embeddings.shape[1]}")
         print(f"🔍🔍 임베딩 벡터 개수: {embeddings.shape[0]}")
@@ -185,16 +199,18 @@ def create_and_save_faiss_index(file_path):
     
     except Exception as e:
         print(f"❌ FAISS 인덱스 생성 및 저장 오류: {e}")
+    
 
 # ✅ 인덱스 로드 또는 생성하기
 def initialize_faiss_index():
     if not os.path.exists(faiss_file_path):
         # 현재 디렉토리의 'db' 폴더 안에서 엑셀 파일을 검색
-        file_path = os.path.join(os.getcwd(), "db", "ownerclan_인기상품_1만개.xlsx")
+        file_path = os.path.join(os.getcwd(), "db", "ownerclan_주간인기상품_5만개.xlsx")
         
         # 🔍 엑셀 데이터 로드 확인
         texts, data = load_excel_to_texts(file_path)
         print(data.head())  # 데이터의 첫 5개 행 출력 (엑셀 데이터 확인용)
+        print(texts[0])  # 텍스트의 첫 번째 항목 출력 
         
         create_and_save_faiss_index(file_path)
     index = load_faiss_index(faiss_file_path)
@@ -231,9 +247,48 @@ def extract_keywords_with_llm(query):
 
         # 기존 대화 이력과 함께 LLM에 전달
         response = llm.invoke([
-            SystemMessage(content="사용자의 대화 내역을 반영하여 상품 검색을 위한 핵심 키워드를 추출해주세요. 만약 단어 간에 띄어쓰기가 있다면 하나의 단어 일수도 있습니다 띄어쓰기가 있다면 단어끼리 붙여서도 문장을 분석해보세요. 여러방법,여러 방면으로 생각해서 추출해주세요. 다른 나라 언어로 질문이 들어오면 질문을 먼저 한글로 번역해서 단어를 추출합니다."),
-            HumanMessage(content=f"질문: {query} \n ")
+            SystemMessage(content="""
+                당신은 상품 추천 챗봇의 핵심 키워드 추출기 역할을 합니다.
+                사용자의 대화 내역을 반영하여 **상품 검색에 적합한 핵심 키워드 목록**을 추출해주세요.
+                만약 단어 간에 띄어쓰기가 있다면 하나의 단어일 수도 있습니다. 띄어쓰기가 있다면 단어끼리 붙여서도 문장을 분석해보세요. 여러 방법, 여러 방면으로 생각해서 추출해주세요.
+
+                ---
+
+                🎯 [목표]
+                - 상품 추천에 필요한 핵심 단어만 간결하게 추출합니다.
+                - 중복되거나 의미가 겹치는 단어는 제거하고 정리합니다.
+
+                🛑 [주의사항 - 부정 표현 필터링]
+                - 사용자가 "싫다", "아니다", "말고", "제외", "안돼", "하지마" 등의 표현을 사용한 경우,
+                해당 단어 또는 관련된 상품 종류는 키워드에서 **제외**해주세요.
+
+                예)
+                - 입력: "스카프 말고 셔츠 보여줘" → 키워드: 셔츠
+                - 입력: "스트라이프 아니어도 돼" → 키워드: 셔츠
+                - 입력: "여성용인데 캐주얼 말고 포멀로" → 키워드: 여성, 포멀
+                - 입력: "코튼은 빼고 린넨 원단 원해" → 키워드: 린넨
+                - 입력: "검정색은 싫고 흰색 계열 보여줘" → 키워드: 흰색
+                - 입력: "니트 말고 반팔티 없어요?" → 키워드: 반팔티
+                - 입력: "긴팔보다는 반팔로 보여주세요" → 키워드: 반팔
+                - 입력: "지난번에 보여준 건 아니고 다른 셔츠 보여줘" → 키워드: 셔츠
+                - 입력: "스커트 말고 바지 쪽으로 추천해줘" → 키워드: 바지
+                - 입력: "체크무늬는 제외하고 추천해줘" → 키워드: 추천
+                - 입력: "슬림핏은 안되고 루즈핏으로" → 키워드: 루즈핏
+                - 입력: "스트라이프는 괜찮지만 도트는 안돼요" → 키워드: 스트라이프
+                - 입력: "겨울옷 말고 봄에 입을 옷 찾아줘" → 키워드: 봄, 옷
+
+                🌐 [언어 변환]
+                - 만약 외국어로 입력되었다면, 먼저 자연스럽게 한국어로 번역한 뒤 핵심 키워드를 추출하세요.
+
+                ---
+
+                📦 [형식]
+                - 쉼표로 구분된 핵심 키워드 목록만 출력하세요.
+                - 예시 출력: 여자, 셔츠, 여름, 린넨
+            """),
+            HumanMessage(content=f"{query}")
         ])
+        
 
         print(f"✅ [Step 4] LLM 응답 확인: {response}")
 
@@ -248,7 +303,7 @@ def extract_keywords_with_llm(query):
             raise ValueError(f"❌ [ERROR] LLM 응답이 비어 있거나 잘못된 데이터입니다: {response.content}")
 
         # 키워드 업데이트
-         # ✅ 응답에서 '핵심 키워드: ' 부분 제거하여 임베딩에 사용하도록 함
+        # ✅ 응답에서 '핵심 키워드: ' 부분 제거하여 임베딩에 사용하도록 함
         keywords_text = response.content.replace("추출된 핵심 키워드:" , "").strip()
         
         # ✅ 벡터 검색용으로는 핵심 키워드 부분을 제거한 텍스트 사용
@@ -274,13 +329,9 @@ def extract_keywords_with_llm(query):
         print(f"❌ [ERROR] extract_keywords_with_llm 실행 중 오류 발생: {e}")
         raise
 
-store = {}  # 빈 딕셔너리를 초기화합니다.
 def get_session_history(session_id: str) -> BaseChatMessageHistory:
-    # 세션 ID에 해당하는 대화 기록이 저장소에 없으면 새로운 ChatMessageHistory를 생성합니다.
-    if session_id not in store:
-        store[session_id] = ChatMessageHistory()
-    # 세션 ID에 해당하는 대화 기록을 반환합니다.
-    return store[session_id]
+    
+    return RedisChatMessageHistory(session_id=session_id, url=REDIS_URL)
 
 def clear_message_history(session_id: str):
     """
@@ -295,8 +346,10 @@ def clear_message_history(session_id: str):
         raise HTTPException(status_code=500, detail="대화 기록 초기화 중 오류가 발생했습니다.")
 
 
-
-
+# 🔥 상품 캐시 (전역 선언)
+PRODUCT_CACHE = {}
+# 🔗 구매하기 버튼 클릭 시 호출되는 ManyChat용 Hook 주소
+MANYCHAT_HOOK_BASE_URL = "https://viable-shark-faithful.ngrok-free.app/product-select"
 
 
 @app.get("/webhook")
@@ -318,9 +371,10 @@ async def verify_webhook(request: Request):
     except Exception as e:
         print(f"❌ 인증 처리 오류: {e}")
         return {"status": "error", "message": str(e)}
-    
+
+
 @app.post("/webhook")
-async def handle_webhook(request: Request):
+async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
     start_time = time.time()
 
     try:
@@ -359,7 +413,7 @@ async def handle_webhook(request: Request):
                         "message": f"세션 {sender_id}의 대화 기록이 초기화되었습니다."
                     }
                 # ✅ AI 응답을 비동기적으로 처리 (별도로 실행)
-                asyncio.create_task(process_ai_response(sender_id, user_message))
+                background_tasks.add_task(process_ai_response, sender_id, user_message)
             
             process_time = time.time() - process_start
             logger.info(f"📊 [Processing Time 메시지 처리 전체 시간]: {process_time:.4f} 초")
@@ -380,46 +434,74 @@ async def handle_webhook(request: Request):
     except Exception as e:
         print(f"❌ 웹훅 처리 오류: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# 🔁 추천 응답 처리 함수
 async def process_ai_response(sender_id: str, user_message: str):
     try:
         print(f"🕒 [AI 처리 시작] 유저 ID: {sender_id}, 메시지: {user_message}")
 
-        # AI 응답 생성 (비동기 처리)
+        # ✅ 외부 응답 생성 (동기 → 비동기 실행)
         loop = asyncio.get_running_loop()
         bot_response = await loop.run_in_executor(executor, external_search_and_generate_response, user_message, sender_id)
 
-        # ✅ 응답 확인 및 전송 처리
+        # ✅ 응답 확인 및 메시지 준비
         if isinstance(bot_response, dict):
             combined_message_text = bot_response.get("combined_message_text", "")
             results = bot_response.get("results", [])
 
-            # ✅ 전송할 메시지 데이터 목록 (이제 리스트가 아님)
+            # ✅ 상품 캐시에 저장 (product_code → 상품 딕셔너리 전체 저장)
+            for product in results:
+                product_code = product.get("상품코드")
+                if product_code:
+                    PRODUCT_CACHE[product_code] = product
+
             messages_data = []
 
-            # ✅ AI 응답 메시지 추가 (combined_message_text가 있을 경우에만)
+            # ✅ AI 응답 메시지 먼저 추가
             if combined_message_text:
                 messages_data.append({
                     "type": "text",
                     "text": combined_message_text
                 })
 
-            # ✅ 상품 정보들을 딕셔너리로 추가
+            # ✅ 각 상품 메시지 구성
             for product in results:
+                product_code = product.get("상품코드", "None")
+
+                # ✅ 이미지 메시지
                 if product.get("이미지"):
                     messages_data.append({
                         "type": "image",
                         "url": product["이미지"]
                     })
+
+                # ✅ 텍스트 메시지 + 버튼
                 messages_data.append({
                     "type": "text",
-                    "text": f"✨ {product['제목']}\n\n가격: {product['가격']}원\n배송비: {product['배송비']}원\n원산지: {product['원산지']}\n",
+                    "text": (
+                        f"✨ {product['제목']}\n\n"
+                        f"가격: {product['가격']}원\n"
+                        f"배송비: {product['배송비']}원\n"
+                        f"원산지: {product['원산지']}\n"
+                    ),
                     "buttons": [
-                        {"type": "url", "caption": "상품 보러가기", "url": product.get("상품링크", "#"), "webview": "full"},
-                        {"type": "url", "caption": "구매하기", "url": product.get("상품링크", "#")}
+                        {
+                            "type": "url",
+                            "caption": "상품 보러가기",
+                            "url": product.get("상품링크", "#"),
+                            "webview": "full"
+                        },
+                        {
+                            "type": "url",
+                            "caption": "구매하기",
+                            "url": f"{MANYCHAT_HOOK_BASE_URL}?sender_id={sender_id}&product_code={product_code}"
+                            
+                        }
                     ]
                 })
 
-            # ✅ send_message()에 원시 데이터 리스트를 넘김
+            # ✅ 메시지 전송
             send_message(sender_id, messages_data)
             print(f"✅ [Combined 메시지 전송 완료]: {combined_message_text}")
 
@@ -429,6 +511,19 @@ async def process_ai_response(sender_id: str, user_message: str):
     except Exception as e:
         print(f"❌ AI 응답 처리 오류: {e}")
 
+def clean_html_content(html_raw: str) -> str:
+    try:
+        html_cleaned = html_raw.replace('\n', '').replace('\r', '')
+        html_cleaned = html_cleaned.replace("“", "\"").replace("”", "\"").replace("‘", "'").replace("’", "'")
+        if html_cleaned.count("<center>") > html_cleaned.count("</center>"):
+            html_cleaned += "</center>"
+        if html_cleaned.count("<p") > html_cleaned.count("</p>"):
+            html_cleaned += "</p>"
+        return html_cleaned
+    except Exception as e:
+        print(f"❌ HTML 정제 오류: {e}")
+        return html_raw
+
 
 '''####################################################################################################################
 external_search_and_generate_response는 ManyChat 같은 외부 서비스와 연동되는 챗봇용 API이고, 구축된 UI 에는 사용되지 않음.
@@ -436,67 +531,65 @@ external_search_and_generate_response는 ManyChat 같은 외부 서비스와 연
 
 # ✅ 외부 검색 및 응답 생성 함수
 def external_search_and_generate_response(request: Union[QueryRequest, str], session_id: str = None) -> dict:  
-    
+
     # ✅ [Step 1] 요청 데이터 확인
     query = request
     print(f"🔍 사용자 검색어: {query}")
 
     if not isinstance(query, str):
         raise TypeError(f"❌ [ERROR] 잘못된 query 타입: {type(query)}")
+    
 
     # ✅ [Step 2] Reset 요청 처리
     if query.lower() == "reset":
         if session_id:
             clear_message_history(session_id)
         return {"message": f"세션 {session_id}의 대화 기록이 초기화되었습니다."}
-    
+
     try:
-        # ✅ [Step 3] Redis 메시지 기록 관리
+        # ✅ Step 3: Redis 기록 불러오기
         redis_start = time.time()
-        session_history = get_message_history(session_id)
+        session_history = get_session_history(session_id)
         redis_time = time.time() - redis_start
         print(f"📊 [Step 3] Redis 메시지 기록 관리 시간: {redis_time:.4f} 초")
 
-        # ✅ [Step 4] 기존 대화 내역 확인
+        # ✅ [Step 4~5] 최신 메시지 기록 다시 불러오기
         previous_queries = [msg.content for msg in session_history.messages if isinstance(msg, HumanMessage)]
-        print(f"🔍 [Step 4] Redis 기존 대화 내역: {previous_queries}")
+        # ✅ 현재 입력값이 이전 대화에 이미 있다면 제거 (중복 방지)
+        if query in previous_queries:
+            previous_queries.remove(query)
+        print(f"🔁 [Step 5] 최신 Redis 대화 내역: {previous_queries}")
+        
+        print("🔍 [DEBUG] Redis 메시지 저장 순서 확인:")
+        for i, msg in enumerate(session_history.messages):
+            print(f"{i+1}번째 ▶️ {type(msg).__name__} | 내용: {msg.content}")
 
-        # ✅ [Step 5] LLM 키워드 추출
+        # ✅ [Step 6] LLM 키워드 추출
         llm_start = time.time()
         combined_query = " ".join(previous_queries + [query])
-        print(f"🔍 [Step 4-1]combined_query: {combined_query}")
+        print(f"🔍 [Step 6-1] combined_query: {combined_query}")
 
-        # ✅ extract_keywords_with_llm 실행 전 확인
         if not combined_query or not isinstance(combined_query, str):
             raise ValueError(f"❌ [ERROR] combined_query가 올바른 문자열이 아닙니다: {combined_query} (타입: {type(combined_query)})")
 
-
         combined_keywords = extract_keywords_with_llm(combined_query)
-
         llm_time = time.time() - llm_start
 
         if not combined_keywords or not isinstance(combined_keywords, str):
             raise ValueError(f"❌ [ERROR] 키워드 추출 실패: {combined_keywords}")
-        
-        print(f"🔍 [Step 4-2] combined_keywords: {combined_keywords}")
-        print(f"✅ [Step 5] 생성된 검색 키워드: {combined_keywords}")
-        print(f"📊 [Step 5-1] LLM 키워드 추출 시간: {llm_time:.4f} 초")
 
-        # ✅ [Step 6] Redis에 사용자 입력 추가
-        session_history.add_message(HumanMessage(content=query))
-        print(f"🔍 [Step 6] Redis 메시지 기록 (변경된 상태): {session_history.messages}")
-        
+        print(f"🔍 [Step 6-2] combined_keywords: {combined_keywords}")
+        print(f"📊 [Step 6-3] LLM 키워드 추출 시간: {llm_time:.4f} 초")
+
         # ✅ [Step 7] 엑셀 데이터 로드
         excel_start = time.time()
-        
         try:
-            _, data = load_excel_to_texts("db/ownerclan_인기상품_1만개.xlsx")
+            _, data = load_excel_to_texts("db/ownerclan_주간인기상품_5만개.xlsx")
         except Exception as e:
             raise ValueError(f"❌ [ERROR] 엑셀 데이터 로딩 실패: {e}")
-        
+
         excel_time = time.time() - excel_start
         print(f"📊 [Step 7] 엑셀 데이터 로드 시간: {excel_time:.4f} 초")
-
 
         # ✅ [Step 8] OpenAI 임베딩 생성
         embedding_start = time.time()
@@ -543,20 +636,46 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
                 try:
                     result_row = data.iloc[idx]
+
+                    # ✅ 상품상세설명 -> base64 인코딩 (디코딩 에러 방지)
+                    html_raw = result_row.get("본문상세설명", "") or ""
+                    html_cleaned = clean_html_content(html_raw)
+
+                    try:
+                        if isinstance(html_raw, bytes):
+                            html_raw = html_raw.decode("cp949")  # 혹시 바이너리 형태일 경우 디코딩
+                    except Exception as e:
+                        print(f"⚠️ [본문 디코딩 경고] cp949 디코딩 실패: {e}")
+
+                    try:
+                        encoded_html = base64.b64encode(html_cleaned.encode("utf-8", errors="ignore")).decode("utf-8")
+                        safe_html = urllib.parse.quote_plus(encoded_html)
+                        preview_url = f"https://viable-shark-faithful.ngrok-free.app/preview?html={safe_html}"
+                    except Exception as e:
+                        print(f"❌ [본문 인코딩 실패] {e}")
+                        preview_url = "https://naver.com"
+
+                    # ✅ 상품링크가 비어있다면 preview_url 사용
+                    product_link = result_row.get("상품링크", "")
+                    if not product_link or product_link in ["링크 없음", "#", None]:
+                        product_link = preview_url
+
                     result_info = {
                         "상품코드": str(result_row.get("상품코드", "없음")),
-                        "제목": result_row.get("원본상품명", "제목 없음"),
-                        "가격": convert_to_serializable(result_row.get("오너클랜판매가", 0)),
+                        "제목": result_row.get("마켓상품명", "제목 없음"),
+                        "가격": convert_to_serializable(result_row.get("마켓실제판매가", 0)),
                         "배송비": convert_to_serializable(result_row.get("배송비", 0)),
                         "이미지": result_row.get("이미지중", "이미지 없음"),
                         "원산지": result_row.get("원산지", "정보 없음"),
-                        "상품링크": result_row.get("본문상세설명", "링크 없음"),
+                        "상품링크": product_link,
+                        # 일단 옵션을 저장하기 위해 추가
+                        "옵션": str(result_row.get("조합형", "")).strip()
                     }
                     results.append(result_info)
                 except KeyError as e:
                     print(f"❌ [ERROR] KeyError: {e}")
-                    continue
-                
+                continue
+
         if not results:
             return {"query": query, "results": [], "message": "검색 결과가 없습니다."}
 
@@ -622,11 +741,8 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         response_time = time.time() - start_response
         print(f"📊 [Step 12] LLM 응답 생성 시간: {response_time:.4f} 초")
 
-        # ✅ Redis에 AI 응답 추가
-        session_history.add_message(AIMessage(content=response.content))
-
         # ✅ 메시지 기록을 Redis에서 가져오기
-        session_history = get_message_history(session_id)
+        session_history = get_session_history(session_id)
         message_history = [
             {"type": type(msg).__name__, "content": msg.content if hasattr(msg, "content") else str(msg)}
             for msg in session_history.messages
@@ -635,10 +751,10 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
         # ✅ 출력 디버깅
         print("*** Response:", response)
-        print("*** Message History:", message_history)
+        #print("*** Message History:", message_history)
         print("✅✅✅✅*✅✅✅✅ Results:", results)
-        print(f"✅ [Before Send] Results Type: {type(results[:5])}")
-        print(f"✅ [Before Send] Results Content: {results[:5]}")
+        #print(f"✅ [Before Send] Results Type: {type(results[:5])}")
+        #print(f"✅ [Before Send] Results Content: {results[:5]}")
 
         # ✅ Combined Message 만들기 (검색 결과 + LLM 응답)
         combined_message_text = f"🤖 AI 답변: {response.content}"
@@ -677,7 +793,7 @@ def send_message(sender_id: str, messages: list):
             return
         
         # ✅ 보낼 데이터 형식 확인
-        print(f"✅ [Before Send] Messages Content: {messages}")
+        #print(f"✅ [Before Send] Messages Content: {messages}")
 
         # ✅ URL 값 확인 후 변경
         for message in messages:
@@ -709,10 +825,10 @@ def send_message(sender_id: str, messages: list):
         
         # ✅ LLM 응답 메시지 보내기
         response = requests.post(url, headers=headers, json=data)
-        if response.status_code == 200:
-            print(f"✅ [ManyChat LLM 메시지 전송 성공]: {response.json()}")
+        '''if response.status_code == 200:
+            print(f"✅ [ManyChat LLM 메시지 전송 성공] : {response.json()}")
         else:
-            print(f"❌ [ManyChat LLM 메시지 전송 실패] 상태 코드: {response.status_code}, 오류 내용: {response.text}")
+            print(f"❌ [ManyChat LLM 메시지 전송 실패] 상태 코드: {response.status_code}, 오류 내용: {response.text}")'''
 
         # Step 2: 상품 정보 메시지들 보내기
         for message in messages[1:]:
@@ -732,7 +848,7 @@ def send_message(sender_id: str, messages: list):
             # ✅ JSON 데이터 직렬화 검사
             try:
                 json_string = json.dumps(data)  # JSON 직렬화 테스트
-                print(f"✅ JSON 직렬화 성공: {json_string[:500]}...")  # 처음 500자만 출력
+                # print(f"✅ JSON 직렬화 성공: {json_string[:500]}...")  # 처음 500자만 출력
             except Exception as e:
                 print(f"❌ [JSON Error] JSON 데이터 직렬화 오류: {e}")
                 continue  # 문제 발생 시 해당 메시지 건너뛰기
@@ -742,12 +858,77 @@ def send_message(sender_id: str, messages: list):
             
             if response.status_code == 200:
                 print(f"✅ [ManyChat 개별 메시지 전송 성공]: {response.json()}")
+                set_custom_field(sender_id,messages)
             else:
                 print(f"❌ [ManyChat 메시지 전송 실패] 상태 코드: {response.status_code}, 오류 내용: {response.text}")
     
     except Exception as e:
         print(f"❌ ManyChat 메시지 전송 오류: {e}")
 
+
+def set_custom_field(subscriber_id: str, field_value: str):
+    url = "https://api.manychat.com/fb/subscriber/setCustomField"
+    headers = {
+        "Authorization": f"Bearer {MANYCHAT_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "subscriber_id": subscriber_id,
+        "field_id": "12730710",
+        "field_value": field_value
+    }
+    response = requests.post(url, headers=headers, json=data)
+    if response.status_code == 200:
+        print(f":흰색_확인_표시: Custom Field 저장 성공")
+    else:
+        print(f":x: Custom Field 저장 실패: {response.status_code}, {response.text}")
+
+
+@app.get("/product-select")
+async def handle_product_selection(sender_id: str, product_code: str):
+    try:
+        product = PRODUCT_CACHE.get(product_code)
+
+        if not product:
+            return {
+                "status": "error",
+                "message": f"상품코드 {product_code}에 대한 정보가 없습니다."
+            }
+
+        # 🔧 메시지 내용 생성 (같이 ManyChat에 보낼 텍스트)
+        info = (
+            f"✅ 선택하신 상품 정보입니다!\n"
+            f"상품코드: {product.get('상품코드')}\n"
+            f"제목: {product.get('제목')}\n"
+            f"가격: {product.get('가격')}원\n"
+            f"배송비: {product.get('배송비')}원\n"
+            f"원산지: {product.get('원산지')}\n"
+            f"옵션:\n{product.get('옵션')}"
+        )
+
+        # ✅ Custom Field 저장
+        set_custom_field(sender_id, info)
+
+        # ✅ 메시지 전송용 데이터 구성
+        messages_data = [
+            {
+                "type": "text",
+                "text": info
+            }
+        ]
+
+        # ✅ ManyChat으로 메시지 전송
+        send_message(sender_id, messages_data)
+
+        return {
+            "status": "success",
+            "message": "상품 정보 전송 및 저장 완료",
+            "saved_info": info
+        }
+
+    except Exception as e:
+        print(f"❌ 상품 선택 처리 오류: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 
@@ -758,6 +939,47 @@ async def serve_home(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 
+@app.get("/preview", response_class=HTMLResponse)
+async def product_preview(html: str):
+    try:
+        decoded_html = base64.b64decode(html).decode("utf-8")
+        return f"""
+        <!DOCTYPE html>
+        <html lang="ko">
+        <head>
+            <meta charset="UTF-8">
+            <title>상품 상세 페이지</title>
+            <style>
+                body {{
+                    font-family: '맑은 고딕', sans-serif;
+                    padding: 20px;
+                    max-width: 800px;
+                    margin: auto;
+                    line-height: 1.5;
+                }}
+                img {{
+                    max-width: 100%;
+                    height: auto;
+                    display: block;
+                    margin: 20px auto;
+                }}
+            </style>
+        </head>
+        <body>
+            {decoded_html}
+        </body>
+        </html>
+        """
+    except Exception as e:
+        return HTMLResponse(content=f"<h1>오류 발생</h1><p>{e}</p>", status_code=400)
+
+
+
+
+
+'''
+#######################################################################################################################
+
 def generate_bot_response(user_message: str) -> str:
     """
     사용자의 메시지를 받아 챗봇 응답을 생성합니다.
@@ -765,7 +987,7 @@ def generate_bot_response(user_message: str) -> str:
     try:
         # ✅ Redis를 이용한 세션 관리
         session_id = f"user_{user_message[:10]}"  # 간단한 세션 ID 생성 (필요 시 사용자 ID 사용)
-        session_history = get_message_history(session_id)
+        session_history = get_session_history(session_id)
 
         # ✅ Redis에서 기존 대화 이력 확인
         print(f"🔍 Redis 메시지 기록 (초기 상태): {session_history.messages}")
@@ -796,7 +1018,6 @@ def generate_bot_response(user_message: str) -> str:
 
 
 # ✅ POST 요청 처리 - `/chatbot`
-################################################################
 # search_and_generate_response는 UI 디자인이 된 웹 UI와 연결된 API 기본적인 API 요청을 통해 JSON 형태의 데이터를 주고 받음.
 
 @app.post("/chatbot")
@@ -818,7 +1039,7 @@ def search_and_generate_response(request: QueryRequest):
 
     try:
         # ✅ Redis 메시지 기록 관리
-        session_history = get_message_history(session_id)
+        session_history = get_session_history(session_id)
         # ✅ 기존 대화 내역 확인
         print(f"🔍 Redis 메시지 기록 (초기 상태): {session_history.messages}")
 
@@ -837,7 +1058,7 @@ def search_and_generate_response(request: QueryRequest):
         session_history.add_message(HumanMessage(content=query))
         print(f"�� Redis 메시지 기록 (변경된 상태): {session_history.messages}")
 
-        _, data = load_excel_to_texts("db/ownerclan_인기상품_1만개.xlsx")
+        _, data = load_excel_to_texts("db/ownerclan_주간인기상품_5만개.xlsx")
 
         # ✅ OpenAI 임베딩 생성
         query_embedding = embed_texts_parallel([combined_keywords], EMBEDDING_MODEL)
@@ -935,7 +1156,7 @@ def search_and_generate_response(request: QueryRequest):
         session_history.add_message(AIMessage(content=response.content))
 
         # ✅ 메시지 기록을 Redis에서 가져오기
-        session_history = get_message_history(session_id)
+        session_history = get_session_history(session_id)
         message_history = [
             {"type": type(msg).__name__, "content": msg.content if hasattr(msg, "content") else str(msg)}
             for msg in session_history.messages
@@ -958,9 +1179,8 @@ def search_and_generate_response(request: QueryRequest):
     except Exception as e:
         print(f"❌ 오류 발생: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+        '''
 
 # ✅ FastAPI 서버 실행 (포트 고정: 5050)
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=5050)
-    
-    
