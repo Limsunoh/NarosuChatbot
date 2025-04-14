@@ -465,45 +465,51 @@ async def process_ai_response(sender_id: str, user_message: str):
                     "text": combined_message_text
                 })
 
-            # ✅ 각 상품 메시지 구성
+            # ✅ 카드형 메시지를 하나로 묶기 위한 elements 리스트
+            cards_elements = []
+
             for product in results:
                 product_code = product.get("상품코드", "None")
 
-                # ✅ 이미지 메시지
-                if product.get("이미지"):
-                    messages_data.append({
-                        "type": "image",
-                        "url": product["이미지"]
-                    })
-
-                # ✅ 텍스트 메시지 + 버튼
-                messages_data.append({
-                    "type": "text",
-                    "text": (
-                        f"✨ {product['제목']}\n\n"
-                        f"가격: {product['가격']}원\n"
-                        f"배송비: {product['배송비']}원\n"
-                        f"원산지: {product['원산지']}\n"
+                cards_elements.append({
+                    "title": f"✨ {product['제목']}",
+                    "subtitle": (
+                        f"가격: {product['가격']}원 | "
+                        f"배송비: {product['배송비']}원 | "
+                        f"원산지: {product['원산지']}"
                     ),
+                    "image_url": product.get("이미지", ""),
                     "buttons": [
                         {
                             "type": "url",
                             "caption": "상품 보러가기",
-                            "url": product.get("상품링크", "#"),
-                            "webview": "full"
+                            "url": product.get("상품링크", "#")
                         },
                         {
-                            "type": "url",
+                            "type": "dynamic_block_callback",
                             "caption": "구매하기",
-                            "url": f"{MANYCHAT_HOOK_BASE_URL}?sender_id={sender_id}&product_code={product_code}"
-                            
+                            "url": "https://viable-shark-faithful.ngrok-free.app/product-select",  # 여기에 너의 FastAPI webhook URL
+                            "method": "post",
+                            "payload": {
+                                "product_code": product_code,
+                                "sender_id": sender_id
+                            }
                         }
                     ]
                 })
 
+            # ✅ 전체 카드 메시지로 추가
+            messages_data.append({
+                "type": "cards",
+                "image_aspect_ratio": "horizontal",  # 또는 "square"
+                "elements": cards_elements
+})
+
             # ✅ 메시지 전송
             send_message(sender_id, messages_data)
             print(f"✅ [Combined 메시지 전송 완료]: {combined_message_text}")
+            print(f"버튼 생성용 product_code: {product_code}")
+            print("✅ 최종 messages_data:", json.dumps(messages_data, indent=2, ensure_ascii=False))
 
         else:
             print(f"❌ AI 응답 오류 발생")
@@ -780,64 +786,44 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
 def send_message(sender_id: str, messages: list):  
     try:  
-        # ✅ ManyChat API URL 및 헤더 설정
         url = "https://api.manychat.com/fb/sending/sendContent"
         headers = {
             "Authorization": f"Bearer {MANYCHAT_API_KEY}",
             "Content-Type": "application/json"
         }
-        
-        # ✅ 전송 데이터 검증
+
+        # ✅ 메시지 구조 확인
         if not isinstance(messages, list):
             print(f"❌ [ERROR] messages는 리스트여야 합니다. 전달된 타입: {type(messages)}")
             return
-        
-        # ✅ 보낼 데이터 형식 확인
-        #print(f"✅ [Before Send] Messages Content: {messages}")
 
-        # ✅ URL 값 확인 후 변경
-        for message in messages:
-            if message.get("buttons"):
-                for button in message["buttons"]:
-                    if button["url"] in ["링크 없음", "#", None, ""]:
-                        button["url"] = "https://naver.com"  # 예시 URL로 변경
-                        
-        # ✅ ManyChat API로 보낼 데이터 구성
-        # Step 1: LLM 응답 메시지를 먼저 보내기
-        llm_message = {
-            "type": "text",
-            "text": messages[0]['text']  # LLM 응답 메시지
-        }
-
-        # ✅ 보낼 데이터 구성 (ManyChat 형식에 맞게)
-        data = {
-            "subscriber_id": sender_id,
-            "data": {
-                "version": "v2",
-                "content": {
-                    "messages": [llm_message],  # 먼저 LLM 응답 메시지를 보냄
-                    "actions": [],
-                    "quick_replies": []
-                }
-            },
-            "message_tag": "ACCOUNT_UPDATE"
-        }
-        
-        # ✅ LLM 응답 메시지 보내기
-        response = requests.post(url, headers=headers, json=data)
-        '''if response.status_code == 200:
-            print(f"✅ [ManyChat LLM 메시지 전송 성공] : {response.json()}")
-        else:
-            print(f"❌ [ManyChat LLM 메시지 전송 실패] 상태 코드: {response.status_code}, 오류 내용: {response.text}")'''
-
-        # Step 2: 상품 정보 메시지들 보내기
-        for message in messages[1:]:
+        # ✅ LLM 응답 (첫 번째 메시지) 전송
+        if messages:
+            llm_text = messages[0]
             data = {
                 "subscriber_id": sender_id,
                 "data": {
                     "version": "v2",
                     "content": {
-                        "messages": [message],  # 개별 상품 메시지
+                        "messages": [llm_text],
+                        "actions": [],
+                        "quick_replies": []
+                    }
+                },
+                "message_tag": "ACCOUNT_UPDATE"
+            }
+            response = requests.post(url, headers=headers, json=data)
+            print(f"✅ [LLM 메시지 전송]: {response.json()}")
+
+        # ✅ 카드 묶음 메시지 전송
+        if len(messages) > 1:
+            card_block = messages[1]
+            data = {
+                "subscriber_id": sender_id,
+                "data": {
+                    "version": "v2",
+                    "content": {
+                        "messages": [card_block],
                         "actions": [],
                         "quick_replies": []
                     }
@@ -845,25 +831,18 @@ def send_message(sender_id: str, messages: list):
                 "message_tag": "ACCOUNT_UPDATE"
             }
 
-            # ✅ JSON 데이터 직렬화 검사
-            try:
-                json_string = json.dumps(data)  # JSON 직렬화 테스트
-                # print(f"✅ JSON 직렬화 성공: {json_string[:500]}...")  # 처음 500자만 출력
-            except Exception as e:
-                print(f"❌ [JSON Error] JSON 데이터 직렬화 오류: {e}")
-                continue  # 문제 발생 시 해당 메시지 건너뛰기
-            
-            # ✅ ManyChat API로 개별 상품 메시지 전송
             response = requests.post(url, headers=headers, json=data)
-            
-            if response.status_code == 200:
-                print(f"✅ [ManyChat 개별 메시지 전송 성공]: {response.json()}")
-                set_custom_field(sender_id,messages)
-            else:
-                print(f"❌ [ManyChat 메시지 전송 실패] 상태 코드: {response.status_code}, 오류 내용: {response.text}")
-    
+            print(f"✅ [카드 메시지 전송]: {response.json()}")
+
+        # ✅ 전체 텍스트 Custom Field 저장 (선택)
+        all_texts = "\n\n".join(
+            [msg["text"] for msg in messages if msg.get("type") == "text"]
+        )
+        set_custom_field(sender_id, all_texts)
+
     except Exception as e:
         print(f"❌ ManyChat 메시지 전송 오류: {e}")
+
 
 
 def set_custom_field(subscriber_id: str, field_value: str):
@@ -879,23 +858,47 @@ def set_custom_field(subscriber_id: str, field_value: str):
     }
     response = requests.post(url, headers=headers, json=data)
     if response.status_code == 200:
-        print(f":흰색_확인_표시: Custom Field 저장 성공")
+        print(f"Custom Field 저장 성공")
     else:
         print(f":x: Custom Field 저장 실패: {response.status_code}, {response.text}")
 
 
-@app.get("/product-select")
-async def handle_product_selection(sender_id: str, product_code: str):
-    try:
-        product = PRODUCT_CACHE.get(product_code)
 
-        if not product:
+@app.post("/product-select")
+async def handle_product_selection(request: Request):
+    try:
+        data = await request.json()
+        payload = data.get("payload", {})
+        sender_id = payload.get("sender_id")
+        product_code = payload.get("product_code")
+
+        if not sender_id or not product_code:
             return {
-                "status": "error",
-                "message": f"상품코드 {product_code}에 대한 정보가 없습니다."
+                "version": "v2",
+                "content": {
+                    "messages": [
+                        {
+                            "type": "text",
+                            "text": "❌ 오류: sender_id 또는 product_code가 없습니다."
+                        }
+                    ]
+                }
             }
 
-        # 🔧 메시지 내용 생성 (같이 ManyChat에 보낼 텍스트)
+        product = PRODUCT_CACHE.get(product_code)
+        if not product:
+            return {
+                "version": "v2",
+                "content": {
+                    "messages": [
+                        {
+                            "type": "text",
+                            "text": f"❌ 상품코드 {product_code}에 대한 정보를 찾을 수 없습니다."
+                        }
+                    ]
+                }
+            }
+
         info = (
             f"✅ 선택하신 상품 정보입니다!\n"
             f"상품코드: {product.get('상품코드')}\n"
@@ -906,29 +909,36 @@ async def handle_product_selection(sender_id: str, product_code: str):
             f"옵션:\n{product.get('옵션')}"
         )
 
-        # ✅ Custom Field 저장
+        # 🔐 선택사항이지만 원한다면 저장도 유지
         set_custom_field(sender_id, info)
 
-        # ✅ 메시지 전송용 데이터 구성
-        messages_data = [
-            {
-                "type": "text",
-                "text": info
-            }
-        ]
-
-        # ✅ ManyChat으로 메시지 전송
-        send_message(sender_id, messages_data)
-
+        # ✅ ManyChat이 기대하는 포맷으로 응답
         return {
-            "status": "success",
-            "message": "상품 정보 전송 및 저장 완료",
-            "saved_info": info
+            "version": "v2",
+            "content": {
+                "messages": [
+                    {
+                        "type": "text",
+                        "text": info
+                    }
+                ]
+            }
         }
 
     except Exception as e:
         print(f"❌ 상품 선택 처리 오류: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "version": "v2",
+            "content": {
+                "messages": [
+                    {
+                        "type": "text",
+                        "text": f"❌ 서버 오류 발생: {str(e)}"
+                    }
+                ]
+            }
+        }
+
 
 
 
