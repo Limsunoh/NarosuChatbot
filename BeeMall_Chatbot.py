@@ -471,12 +471,22 @@ async def process_ai_response(sender_id: str, user_message: str):
             for product in results:
                 product_code = product.get("상품코드", "None")
 
+                # 가격과 배송비 정수 변환 후 포맷팅
+                try:
+                    price = int(float(product.get("가격", 0)))
+                except:
+                    price = 0
+                try:
+                    shipping = int(float(product.get("배송비", 0)))
+                except:
+                    shipping = 0
+
                 cards_elements.append({
                     "title": f"✨ {product['제목']}",
                     "subtitle": (
-                        f"가격: {product['가격']}원 | "
-                        f"배송비: {product['배송비']}원 | "
-                        f"원산지: {product['원산지']}"
+                        f"가격: {price:,}원\n"
+                        f"배송비: {shipping:,}원\n"
+                        f"원산지: {product.get('원산지', '')}"
                     ),
                     "image_url": product.get("이미지", ""),
                     "buttons": [
@@ -488,7 +498,7 @@ async def process_ai_response(sender_id: str, user_message: str):
                         {
                             "type": "dynamic_block_callback",
                             "caption": "구매하기",
-                            "url": "https://viable-shark-faithful.ngrok-free.app/product-select",  # 여기에 너의 FastAPI webhook URL
+                            "url": "https://viable-shark-faithful.ngrok-free.app/product-select",
                             "method": "post",
                             "payload": {
                                 "product_code": product_code,
@@ -868,9 +878,8 @@ def set_custom_field(subscriber_id: str, field_value: str):
 async def handle_product_selection(request: Request):
     try:
         data = await request.json()
-        payload = data.get("payload", {})
-        sender_id = payload.get("sender_id")
-        product_code = payload.get("product_code")
+        sender_id = data.get("sender_id")
+        product_code = data.get("product_code")
 
         if not sender_id or not product_code:
             return {
@@ -899,20 +908,40 @@ async def handle_product_selection(request: Request):
                 }
             }
 
-        info = (
-            f"✅ 선택하신 상품 정보입니다!\n"
-            f"상품코드: {product.get('상품코드')}\n"
-            f"제목: {product.get('제목')}\n"
-            f"가격: {product.get('가격')}원\n"
-            f"배송비: {product.get('배송비')}원\n"
-            f"원산지: {product.get('원산지')}\n"
-            f"옵션:\n{product.get('옵션')}"
-        )
+        # 🎯 가격과 배송비 정수 변환
+        try:
+            price = int(float(product.get("가격", 0)))
+        except:
+            price = 0
+        try:
+            shipping = int(float(product.get("배송비", 0)))
+        except:
+            shipping = 0
+        total_price = price + shipping
 
-        # 🔐 선택사항이지만 원한다면 저장도 유지
+        # 🎯 옵션이 있는 경우에만 출력
+        option = product.get("옵션", "").strip()
+        show_option = option and option.lower() != "nan"
+
+        # 🎯 메시지 텍스트 구성
+        info_lines = [
+            "✅ 선택하신 상품 정보입니다!",
+            f"상품코드: {product.get('상품코드')}",
+            f"제목: {product.get('제목')}",
+            f"가격: {price:,}원",
+            f"배송비: {shipping:,}원",
+            f"최종 결제금액: {total_price:,}원",
+            f"원산지: {product.get('원산지')}"
+        ]
+        if show_option:
+            info_lines.append(f"옵션:\n{option}")
+
+        info = "\n".join(info_lines)
+
+        # ✅ 저장도 유지 (선택사항)
         set_custom_field(sender_id, info)
 
-        # ✅ ManyChat이 기대하는 포맷으로 응답
+        # ✅ 메시지 전송
         return {
             "version": "v2",
             "content": {
@@ -921,6 +950,9 @@ async def handle_product_selection(request: Request):
                         "type": "text",
                         "text": info
                     }
+                ],
+                "redirect_to_blocks": [
+                    "Custom_field"  # 👈 이걸 ManyChat에서 연결할 블록 이름으로 설정
                 ]
             }
         }
@@ -938,6 +970,7 @@ async def handle_product_selection(request: Request):
                 ]
             }
         }
+
 
 
 
