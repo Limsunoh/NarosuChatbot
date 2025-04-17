@@ -844,11 +844,11 @@ def send_message(sender_id: str, messages: list):
             response = requests.post(url, headers=headers, json=data)
             print(f"✅ [카드 메시지 전송]: {response.json()}")
 
-        # ✅ 전체 텍스트 Custom Field 저장 (선택)
+        '''# ✅ 전체 텍스트 Custom Field 저장 (선택)
         all_texts = "\n\n".join(
             [msg["text"] for msg in messages if msg.get("type") == "text"]
         )
-        set_custom_field(sender_id, all_texts)
+        set_custom_field(sender_id, all_texts)'''
 
     except Exception as e:
         print(f"❌ ManyChat 메시지 전송 오류: {e}")
@@ -869,17 +869,23 @@ def set_custom_field(subscriber_id: str, field_value: str):
     response = requests.post(url, headers=headers, json=data)
     if response.status_code == 200:
         print(f"Custom Field 저장 성공")
+        print(f"Custom Field 저장 성공: {response.json()}")
+        print(f"Custom Field 저장 성공: {field_value}")
     else:
         print(f":x: Custom Field 저장 실패: {response.status_code}, {response.text}")
 
 
+class ProductSelection(BaseModel):
+    sender_id: str
+    product_code: str
+
 
 @app.post("/product-select")
-async def handle_product_selection(request: Request):
+def handle_product_selection(data: ProductSelection):
     try:
-        data = await request.json()
-        sender_id = data.get("sender_id")
-        product_code = data.get("product_code")
+        #data = request.json()
+        sender_id = data.sender_id
+        product_code = data.product_code
 
         if not sender_id or not product_code:
             return {
@@ -894,7 +900,7 @@ async def handle_product_selection(request: Request):
                 }
             }
 
-        product = PRODUCT_CACHE.get(product_code)
+        product = PRODUCT_CACHE[product_code]
         if not product:
             return {
                 "version": "v2",
@@ -925,7 +931,6 @@ async def handle_product_selection(request: Request):
 
         # 🎯 메시지 텍스트 구성
         info_lines = [
-            "✅ 선택하신 상품 정보입니다!",
             f"상품코드: {product.get('상품코드')}",
             f"제목: {product.get('제목')}",
             f"가격: {price:,}원",
@@ -938,9 +943,9 @@ async def handle_product_selection(request: Request):
 
         info = "\n".join(info_lines)
 
-        # ✅ 저장도 유지 (선택사항)
-        set_custom_field(sender_id, info)
-
+        unique_value = f"상품코드-{product_code}-{int(time.time())}"
+        set_custom_field(sender_id, unique_value)
+        
         # ✅ 메시지 전송
         return {
             "version": "v2",
@@ -950,9 +955,6 @@ async def handle_product_selection(request: Request):
                         "type": "text",
                         "text": info
                     }
-                ],
-                "redirect_to_blocks": [
-                    "Custom_field"  # 👈 이걸 ManyChat에서 연결할 블록 이름으로 설정
                 ]
             }
         }
@@ -970,10 +972,6 @@ async def handle_product_selection(request: Request):
                 ]
             }
         }
-
-
-
-
 
 
 # ✅ 루트 경로 - HTML 페이지 렌더링
