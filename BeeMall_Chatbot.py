@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Union
+from typing import Union, Optional
 
 import faiss
 import numpy as np
@@ -14,6 +14,7 @@ import requests
 import uvicorn
 import base64
 import urllib
+import re
 
 from urllib.parse import quote
 from dotenv import load_dotenv
@@ -914,6 +915,9 @@ class ManychatFieldUpdater:
     
     def set_product_selection_option(self, field_id: str, option: str):
         self.set_field(field_id, option)
+    
+    def set_extra_price(self, field_id: str, extra_price: int):
+        self.set_field(field_id, extra_price)
 
 
 class Product_Selections(BaseModel):
@@ -980,7 +984,7 @@ def handle_product_selection(data: Product_Selections):
         updater.set_unique_code("12886380", product.get('상품코드'))
         updater.set_product_name("12886273", product.get('제목'))
         updater.set_option("12886363", option_display)
-        updater.set_price("12890668", price)      # 새 필드 ID로
+        updater.set_price("12890668", price)      
         updater.set_shipping("12890670", shipping)
 
         # ✅ sendContent API 전송 형식
@@ -1039,13 +1043,15 @@ def handle_product_selection(data: Product_Selections):
 class Option_Selections(BaseModel):
     version: str
     field: str
-    value: Product_Selections
+    value: dict
+    page: Optional[int] = 1
 
 
 @app.post("/manychat-option-request")
 def handle_option_request(data: Option_Selections):
-    sender_id = data.value.sender_id
-    product_code = data.value.product_code
+    sender_id = data.value.get("sender_id") if isinstance(data.value, dict) else None
+    product_code = data.value.get("product_code") if isinstance(data.value, dict) else None
+    page = data.page or 1
 
     product = PRODUCT_CACHE.get(product_code)
     if not product:
@@ -1065,59 +1071,79 @@ def handle_option_request(data: Option_Selections):
             }
         }
 
-    image_url = product.get("이미지", "")
     options = options_raw.strip().split("\n")
-    card_batches = []
-    current_batch = []
+    start_idx = (page - 1) * 27
+    end_idx = start_idx + 27
+    paged_options = options[start_idx:end_idx]
 
-    for i, opt in enumerate(options):
+    message_batches = []
+    current_buttons = []
+
+    for opt in paged_options:
         try:
             name, extra_price, stock = opt.split(",")
             caption = f"{name.strip()} (+{int(float(extra_price)):,}원)" if float(extra_price) > 0 else name.strip()
 
-            current_batch.append({
-                "title": caption,
-                "image_url": image_url,
-                "buttons": [
-                    {
-                        "type": "dynamic_block_callback",
-                        "caption": "선택",
-                        "url": "https://viable-shark-faithful.ngrok-free.app/manychat-option-select",
-                        "method": "post",
-                        "headers": {"Content-Type": "application/json"},
-                        "payload": {
-                            "sender_id": sender_id,
-                            "selected_option": caption
-                        }
-                    }
-                ]
+            current_buttons.append({
+                "type": "dynamic_block_callback",
+                "caption": caption,
+                "url": "https://viable-shark-faithful.ngrok-free.app/manychat-option-select",
+                "method": "post",
+                "headers": {"Content-Type": "application/json"},
+                "payload": {
+                    "sender_id": sender_id,
+                    "selected_option": caption
+                }
             })
 
-            # 10개 카드마다 한 묶음으로 저장
-            if len(current_batch) == 10:
-                card_batches.append(current_batch)
-                current_batch = []
+            if len(current_buttons) == 3:
+                message_batches.append({
+                    "type": "text",
+                    "text": "옵션을 선택해주세요:",
+                    "buttons": current_buttons
+                })
+                current_buttons = []
 
         except Exception as e:
             print(f"⚠️ 옵션 파싱 실패: {opt} → {e}")
             continue
 
-    if current_batch:
-        card_batches.append(current_batch)
+    if current_buttons:
+        message_batches.append({
+            "type": "text",
+            "text": "옵션을 선택해주세요:",
+            "buttons": current_buttons
+        })
 
-    # 전체 메시지 배열 구성
-    messages = []
-    for card_group in card_batches:
-        messages.append({
-            "type": "cards",
-            "image_aspect_ratio": "horizontal",
-            "elements": card_group
+    # 다음 페이지 버튼 추가
+    if end_idx < len(options):
+        message_batches.append({
+            "type": "text",
+            "text": "다음 옵션을 보시겠습니까?",
+            "buttons": [
+                {
+                    "type": "dynamic_block_callback",
+                    "caption": "다음 옵션 보기",
+                    "url": "https://viable-shark-faithful.ngrok-free.app/manychat-option-request",
+                    "method": "post",
+                    "headers": {"Content-Type": "application/json"},
+                    "payload": {
+                        "version": "v2",
+                        "field": "messages",
+                        "value": {
+                            "sender_id": sender_id,
+                            "product_code": product_code
+                        },
+                        "page": page + 1
+                    }
+                }
+            ]
         })
 
     return {
         "version": "v2",
         "content": {
-            "messages": messages
+            "messages": message_batches
         }
     }
 
@@ -1130,8 +1156,18 @@ def handle_option_selection(payload: dict):
     if not sender_id or not selected_option:
         return {"detail": "sender_id 또는 selected_option이 없습니다."}
 
+    # ✅ 추가금액 추출
+    extra_price = 0
+    match = re.search(r'\(\+([\d,]+)원\)', selected_option)
+    if match:
+        try:
+            extra_price = int(match.group(1).replace(",", ""))
+        except:
+            extra_price = 0
+
     updater = ManychatFieldUpdater(sender_id, MANYCHAT_API_KEY)
     updater.set_product_selection_option("12904981", selected_option)
+    updater.set_extra_price("12911810", extra_price)
 
     return {
         "version": "v2",
@@ -1139,12 +1175,11 @@ def handle_option_selection(payload: dict):
             "messages": [
                 {
                     "type": "text",
-                    "text": f"✅ 옵션이 선택되었습니다: {selected_option}"
+                    "text": f"✅ 옵션이 선택되었습니다: {selected_option} (추가금액: {extra_price:,}원)"
                 }
             ]
         }
     }
-
 
 
 # ✅ 루트 경로 - HTML 페이지 렌더링
