@@ -1,10 +1,14 @@
 import asyncio
+import base64
 import json
 import logging
 import os
+import re
 import time
+import urllib
 from concurrent.futures import ThreadPoolExecutor
-from typing import Union
+from typing import Optional, Union
+from urllib.parse import quote
 
 import faiss
 import numpy as np
@@ -12,12 +16,8 @@ import pandas as pd
 import redis
 import requests
 import uvicorn
-import base64
-import urllib
-
-from urllib.parse import quote
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, APIRouter
+from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
@@ -47,7 +47,7 @@ print(f"🔍 로드된 PAGE_ACCESS_TOKEN: {PAGE_ACCESS_TOKEN}")
 print(f"🔍 로드된 API_KEY: {API_KEY}")
 
 # ✅ FAISS 인덱스 파일 경로 설정
-faiss_file_path = f"04_03_faiss_3s.faiss"
+faiss_file_path = f"04_28_faiss_3s.faiss"
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 
@@ -205,7 +205,7 @@ def create_and_save_faiss_index(file_path):
 def initialize_faiss_index():
     if not os.path.exists(faiss_file_path):
         # 현재 디렉토리의 'db' 폴더 안에서 엑셀 파일을 검색
-        file_path = os.path.join(os.getcwd(), "db", "ownerclan_주간인기상품_5만개.xlsx")
+        file_path = os.path.join(os.getcwd(), "db", "ownerclan_주간인기상품_0428.xlsx")
         
         # 🔍 엑셀 데이터 로드 확인
         texts, data = load_excel_to_texts(file_path)
@@ -473,45 +473,61 @@ async def process_ai_response(sender_id: str, user_message: str):
                     "text": combined_message_text
                 })
 
-            # ✅ 각 상품 메시지 구성
+            # ✅ 카드형 메시지를 하나로 묶기 위한 elements 리스트
+            cards_elements = []
+
             for product in results:
                 product_code = product.get("상품코드", "None")
 
-                # ✅ 이미지 메시지
-                if product.get("이미지"):
-                    messages_data.append({
-                        "type": "image",
-                        "url": product["이미지"]
-                    })
+                # 가격과 배송비 정수 변환 후 포맷팅
+                try:
+                    price = int(float(product.get("가격", 0)))
+                except:
+                    price = 0
+                try:
+                    shipping = int(float(product.get("배송비", 0)))
+                except:
+                    shipping = 0
 
-                # ✅ 텍스트 메시지 + 버튼
-                messages_data.append({
-                    "type": "text",
-                    "text": (
-                        f"✨ {product['제목']}\n\n"
-                        f"가격: {product['가격']}원\n"
-                        f"배송비: {product['배송비']}원\n"
-                        f"원산지: {product['원산지']}\n"
+                cards_elements.append({
+                    "title": f"✨ {product['제목']}",
+                    "subtitle": (
+                        f"가격: {price:,}원\n"
+                        f"배송비: {shipping:,}원\n"
+                        f"원산지: {product.get('원산지', '')}"
                     ),
+                    "image_url": product.get("이미지", ""),
                     "buttons": [
                         {
                             "type": "url",
                             "caption": "상품 보러가기",
-                            "url": product.get("상품링크", "#"),
-                            "webview": "full"
+                            "url": product.get("상품링크", "#")
                         },
                         {
-                            "type": "postback",
-                            "title": "구매하기",
-                            "payload": f"BUY::{product_code}"
-                            
+                            "type": "dynamic_block_callback",
+                            "caption": "구매하기",
+                            "url": "https://viable-shark-faithful.ngrok-free.app/product-select",
+                            "method": "post",
+                            "payload": {
+                                "product_code": product_code,
+                                "sender_id": sender_id
+                            }
                         }
                     ]
                 })
 
+            # ✅ 전체 카드 메시지로 추가
+            messages_data.append({
+                "type": "cards",
+                "image_aspect_ratio": "horizontal",  # 또는 "square"
+                "elements": cards_elements
+})
+
             # ✅ 메시지 전송
             send_message(sender_id, messages_data)
             print(f"✅ [Combined 메시지 전송 완료]: {combined_message_text}")
+            print(f"버튼 생성용 product_code: {product_code}")
+            print("✅ 최종 messages_data:", json.dumps(messages_data, indent=2, ensure_ascii=False))
 
         else:
             print(f"❌ AI 응답 오류 발생")
@@ -592,7 +608,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         # ✅ [Step 7] 엑셀 데이터 로드
         excel_start = time.time()
         try:
-            _, data = load_excel_to_texts("db/ownerclan_주간인기상품_5만개.xlsx")
+            _, data = load_excel_to_texts("db/ownerclan_주간인기상품_0428.xlsx")
         except Exception as e:
             raise ValueError(f"❌ [ERROR] 엑셀 데이터 로딩 실패: {e}")
 
@@ -668,6 +684,23 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                     if not product_link or product_link in ["링크 없음", "#", None]:
                         product_link = preview_url
 
+                    # ✅ 옵션 처리: 조합형옵션 → '옵션명 (+가격)' 형식, 재고는 표시 안함
+                    option_raw = str(result_row.get("조합형옵션", "")).strip()
+                    option_display = "없음"
+                    if option_raw and option_raw.lower() != "nan":
+                        option_lines = option_raw.splitlines()
+                        parsed_options = []
+                        for line in option_lines:
+                            try:
+                                name, extra_price, _ = line.split(",")
+                                extra_price = int(float(extra_price))
+                                price_str = f"(+{extra_price:,}원)" if extra_price > 0 else ""
+                                parsed_options.append(f"{name} {price_str}".strip())
+                            except Exception as e:
+                                print(f"⚠️ 옵션 파싱 실패: {line} → {e}")
+                                parsed_options.append(name)
+                        option_display = "\n".join(parsed_options)
+
                     result_info = {
                         "상품코드": str(result_row.get("상품코드", "없음")),
                         "제목": result_row.get("마켓상품명", "제목 없음"),
@@ -676,13 +709,19 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                         "이미지": result_row.get("이미지중", "이미지 없음"),
                         "원산지": result_row.get("원산지", "정보 없음"),
                         "상품링크": product_link,
-                        # 일단 옵션을 저장하기 위해 추가
-                        "옵션": str(result_row.get("조합형", "")).strip()
+                        "옵션": option_display,
+                        "조합형옵션": option_raw,
+                        "최대구매수량": convert_to_serializable(result_row.get("최대구매수량", 0))
                     }
                     results.append(result_info)
+                    
+                    # ✅ 상품 코드 기준으로 캐시에 저장
+                    PRODUCT_CACHE[result_info["상품코드"]] = result_info
+
                 except KeyError as e:
                     print(f"❌ [ERROR] KeyError: {e}")
                 continue
+
 
         if not results:
             return {"query": query, "results": [], "message": "검색 결과가 없습니다."}
@@ -698,10 +737,10 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
             )
         else:
             results_text = "검색 결과가 없습니다."
-            
-        message_history=[]
+        
         
         # ✅ [Step 12] LLM 기반 대화 응답 생성
+        message_history=[]
         start_response = time.time()    
         # ✅ ChatPromptTemplate 및 RunnableWithMessageHistory 생성
         llm = ChatOpenAI(model="gpt-4o-mini", openai_api_key=API_KEY)
@@ -758,11 +797,11 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
 
         # ✅ 출력 디버깅
-        print("*** Response:", response)
+        #print("*** Response:", response)
         #print("*** Message History:", message_history)
         #print("✅✅✅✅*✅✅✅✅ Results:", results)
-        print(f"✅ [Before Send] Results Type: {type(results[:5])}")
-        print(f"✅ [Before Send] Results Content: {results[:5]}")
+        #print(f"✅ [Before Send] Results Type: {type(results[:5])}")
+        #print(f"✅ [Before Send] Results Content: {results[:5]}")
 
         # ✅ Combined Message 만들기 (검색 결과 + LLM 응답)
         combined_message_text = f"🤖 AI 답변: {response.content}"
@@ -788,65 +827,44 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
 
 def send_message(sender_id: str, messages: list):  
     try:  
-        # ✅ ManyChat API URL 및 헤더 설정
         url = "https://api.manychat.com/fb/sending/sendContent"
         headers = {
             "Authorization": f"Bearer {MANYCHAT_API_KEY}",
             "Content-Type": "application/json"
         }
-        
-        # ✅ 전송 데이터 검증
+
+        # ✅ 메시지 구조 확인
         if not isinstance(messages, list):
             print(f"❌ [ERROR] messages는 리스트여야 합니다. 전달된 타입: {type(messages)}")
             return
-        
-        # ✅ 보낼 데이터 형식 확인
-        #print(f"✅ [Before Send] Messages Content: {messages}")
 
-        # ✅ URL 값 확인 후 변경
-        for message in messages:
-            if message.get("buttons"):
-                for button in message["buttons"]:
-                    if button.get("type") == "url":
-                        if button.get("url") in ["링크 없음", "#", None, ""]:
-                            button["url"] = "https://naver.com"
-                            
-        # ✅ ManyChat API로 보낼 데이터 구성
-        # Step 1: LLM 응답 메시지를 먼저 보내기
-        llm_message = {
-            "type": "text",
-            "text": messages[0]['text']  # LLM 응답 메시지
-        }
-
-        # ✅ 보낼 데이터 구성 (ManyChat 형식에 맞게)
-        data = {
-            "subscriber_id": sender_id,
-            "data": {
-                "version": "v2",
-                "content": {
-                    "messages": [llm_message],  # 먼저 LLM 응답 메시지를 보냄
-                    "actions": [],
-                    "quick_replies": []
-                }
-            },
-            "message_tag": "ACCOUNT_UPDATE"
-        }
-        
-        # ✅ LLM 응답 메시지 보내기
-        response = requests.post(url, headers=headers, json=data)
-        '''if response.status_code == 200:
-            print(f"✅ [ManyChat LLM 메시지 전송 성공] : {response.json()}")
-        else:
-            print(f"❌ [ManyChat LLM 메시지 전송 실패] 상태 코드: {response.status_code}, 오류 내용: {response.text}")'''
-
-        # Step 2: 상품 정보 메시지들 보내기
-        for message in messages[1:]:
+        # ✅ LLM 응답 (첫 번째 메시지) 전송
+        if messages:
+            llm_text = messages[0]
             data = {
                 "subscriber_id": sender_id,
                 "data": {
                     "version": "v2",
                     "content": {
-                        "messages": [message],  # 개별 상품 메시지
+                        "messages": [llm_text],
+                        "actions": [],
+                        "quick_replies": []
+                    }
+                },
+                "message_tag": "ACCOUNT_UPDATE"
+            }
+            response = requests.post(url, headers=headers, json=data)
+            print(f"✅ [LLM 메시지 전송]: {response.json()}")
+
+        # ✅ 카드 묶음 메시지 전송
+        if len(messages) > 1:
+            card_block = messages[1]
+            data = {
+                "subscriber_id": sender_id,
+                "data": {
+                    "version": "v2",
+                    "content": {
+                        "messages": [card_block],
                         "actions": [],
                         "quick_replies": []
                     }
@@ -854,91 +872,363 @@ def send_message(sender_id: str, messages: list):
                 "message_tag": "ACCOUNT_UPDATE"
             }
 
-            # ✅ JSON 데이터 직렬화 검사
-            try:
-                json_string = json.dumps(data)  # JSON 직렬화 테스트
-                # print(f"✅ JSON 직렬화 성공: {json_string[:500]}...")  # 처음 500자만 출력
-            except Exception as e:
-                print(f"❌ [JSON Error] JSON 데이터 직렬화 오류: {e}")
-                continue  # 문제 발생 시 해당 메시지 건너뛰기
-            
-            # ✅ ManyChat API로 개별 상품 메시지 전송
             response = requests.post(url, headers=headers, json=data)
-            
-            if response.status_code == 200:
-                print(f"✅ [ManyChat 개별 메시지 전송 성공]: {response.json()}")
-                set_custom_field(sender_id,messages)
-            else:
-                print(f"❌ [ManyChat 메시지 전송 실패] 상태 코드: {response.status_code}, 오류 내용: {response.text}")
-    
+            print(f"✅ [카드 메시지 전송]: {response.json()}")
+
+        '''# ✅ 전체 텍스트 Custom Field 저장 (선택)
+        all_texts = "\n\n".join(
+            [msg["text"] for msg in messages if msg.get("type") == "text"]
+        )
+        set_custom_field(sender_id, all_texts)'''
+
     except Exception as e:
         print(f"❌ ManyChat 메시지 전송 오류: {e}")
 
+class ManychatFieldUpdater:
+    BASE_URL = "https://api.manychat.com/fb/subscriber/setCustomField"
+    
+    def __init__(self, subscriber_id: str, api_key: str):
+        self.subscriber_id = subscriber_id
+        self.headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
 
-def set_custom_field(subscriber_id: str, field_value: str):
-    url = "https://api.manychat.com/fb/subscriber/setCustomField"
-    headers = {
-        "Authorization": f"Bearer {MANYCHAT_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "subscriber_id": subscriber_id,
-        "field_id": "12730710",
-        "field_value": field_value
-    }
-    response = requests.post(url, headers=headers, json=data)
-    if response.status_code == 200:
-        print(f":흰색_확인_표시: Custom Field 저장 성공")
-    else:
-        print(f":x: Custom Field 저장 실패: {response.status_code}, {response.text}")
+    def set_field(self, field_id: str, value):
+        data = {
+            "subscriber_id": self.subscriber_id,
+            "field_id": field_id,
+            "field_value": value
+        }
+        response = requests.post(self.BASE_URL, headers=self.headers, json=data)
+        if response.status_code == 200:
+            print(f"✅ {field_id} 저장 성공: {value}")
+        else:
+            print(f"❌ {field_id} 저장 실패: {response.status_code}, {response.text}")
+
+    def set_unique_code(self, field_id: str, code: str):
+        self.set_field(field_id, code)
+
+    def set_product_name(self, field_id: str, name: str):
+        self.set_field(field_id, name)
+
+    def set_option(self, field_id: str, option: str):
+        self.set_field(field_id, option)
+
+    def set_price(self, field_id: str, price: int):
+        self.set_field(field_id, price)
+
+    def set_shipping(self, field_id: str, shipping: int):
+        self.set_field(field_id, shipping)
+    
+    def set_product_selection_option(self, field_id: str, option: str):
+        self.set_field(field_id, option)
+    
+    def set_extra_price(self, field_id: str, extra_price: int):
+        self.set_field(field_id, extra_price)
+    
+    def set_product_max_quantity(self, field_id: str, max_quantity: int):
+        self.set_field(field_id, max_quantity)
+
+
+class Product_Selections(BaseModel):
+    sender_id: str
+    product_code: str
 
 
 @app.post("/product-select")
-async def handle_product_selection(sender_id: str, product_code: str):
-    """
-    구매하기 버튼 클릭 시 호출되는 핸들러 (웹/포스트백 공통)
-    상품 정보를 Messenger에 전송하고, Custom Field에 저장함
-    """
+def handle_product_selection(data: Product_Selections):
     try:
-        product = PRODUCT_CACHE.get(product_code)
+        sender_id = data.sender_id
+        product_code = data.product_code
 
-        if not product:
+        if not sender_id or not product_code:
             return {
-                "status": "error",
-                "message": f"❌ 상품코드 '{product_code}'에 대한 정보가 없습니다."
+                "version": "v2",
+                "content": {
+                    "messages": [{"type": "text", "text": "❌ sender_id 또는 product_code가 없습니다."}]
+                }
             }
 
-        # ✅ 메시지 내용 생성
-        info = (
-            f"✅ 선택하신 상품 정보입니다!\n"
-            f"상품코드: {product.get('상품코드')}\n"
-            f"제목: {product.get('제목')}\n"
-            f"가격: {product.get('가격')}원\n"
-            f"배송비: {product.get('배송비')}원\n"
-            f"원산지: {product.get('원산지')}\n"
-            f"옵션:\n{product.get('옵션')}"
-        )
+        product = PRODUCT_CACHE.get(product_code)
+        if not product:
+            return {
+                "version": "v2",
+                "content": {
+                    "messages": [{"type": "text", "text": f"❌ 상품코드 {product_code}에 대한 정보를 찾을 수 없습니다."}]
+                }
+            }
 
-        # ✅ Custom Field 저장
-        set_custom_field(sender_id, info)
+        # 가격, 옵션 정리
+        price = int(float(product.get("가격", 0) or 0))
+        shipping = int(float(product.get("배송비", 0) or 0))
+        option_raw = product.get("조합형옵션", "").strip()
 
-        # ✅ Messenger 메시지 전송
-        await send_message(sender_id, [{"type": "text", "text": info}])
-        print(f"✅ Messenger에 상품 정보 전송 완료 (상품코드: {product_code})")
+        option_display = "없음"
+        if option_raw and option_raw.lower() != "nan":
+            option_lines = option_raw.splitlines()
+            parsed_options = []
+            for line in option_lines:
+                try:
+                    name, extra_price, _ = line.split(",")
+                    extra_price = int(float(extra_price))
+                    price_str = f"(+{extra_price:,}원)" if extra_price > 0 else ""
+                    parsed_options.append(f"{name.strip()} {price_str}".strip())
+                except Exception:
+                    parsed_options.append(line.strip())
+            option_display = "\n".join(parsed_options)
+
+        # ✅ Manychat Field 업데이트
+        updater = ManychatFieldUpdater(sender_id, MANYCHAT_API_KEY)
+        updater.set_unique_code("12886380", product.get('상품코드'))
+        updater.set_product_name("12886273", product.get('제목'))
+        updater.set_option("12886363", option_display)
+        updater.set_price("12890668", price)
+        updater.set_shipping("12890670", shipping)
+        updater.set_product_max_quantity("12922068", product.get('최대구매수량'))
+
+        # ✅ 외부 Flow 트리거 (비동기처럼 요청 보내기)
+        headers = {
+            "Authorization": f"Bearer {MANYCHAT_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        flow_payload = {
+            "subscriber_id": sender_id,
+            "flow_ns": "content20250417015933_369132"
+        }
+        try:
+            res = requests.post(
+                "https://api.manychat.com/fb/sending/sendFlow",
+                headers=headers,
+                json=flow_payload,
+                timeout=5  # 실패해도 바로 리턴 안 끌려가게
+            )
+            print("✅ ManyChat Flow 전송 결과:", res.json())
+        except Exception as e:
+            print(f"❌ Flow 전송 실패: {e}")
+
+        # ✅ 최종 클라이언트 응답 (Manychat Dynamic Block 규격)
+        info_message = (
+            f"상품코드\n{product.get('상품코드', '없음')}\n"
+            f"제목\n{product.get('제목', '없음')}\n"
+            f"원산지\n{product.get('원산지', '없음')}\n"
+            f"------------------------------------------\n"
+            f"가격\n{price:,}원\n"
+            f"배송비\n{shipping:,}원\n"
+            f"묶음배송수량\n{product.get('최대구매수량','0')}개\n"
+            f"------------------------------------------\n"
+            f"옵션\n{option_display}\n"
+            f"------------------------------------------"
+        ).strip()
 
         return {
-            "status": "success",
-            "message": "상품 정보 전송 및 저장 완료",
-            "saved_info": info
+            "version": "v2",
+            "content": {
+                "messages": [
+                    {
+                        "type": "text",
+                        "text": info_message
+                    }
+                ]
+            }
         }
 
     except Exception as e:
         print(f"❌ 상품 선택 처리 오류: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "version": "v2",
+            "content": {
+                "messages": [{"type": "text", "text": f"❌ 서버 오류 발생: {str(e)}"}]
+            }
+        }
 
 
 
+class Option_Selections(BaseModel):
+    version: str
+    field: str
+    value: dict
+    page: Optional[int] = 1
 
+
+@app.post("/manychat-option-request")
+def handle_option_request(data: Option_Selections):
+    sender_id = data.value.get("sender_id") if isinstance(data.value, dict) else None
+    product_code = data.value.get("product_code") if isinstance(data.value, dict) else None
+    page = data.page or 1
+
+    if not sender_id or not product_code:
+        return {
+            "version": "v2",
+            "content": {
+                "messages": [{"type": "text", "text": "❌ sender_id 또는 product_code가 없습니다."}]
+            }
+        }
+
+    product = PRODUCT_CACHE.get(product_code)
+    if not product:
+        return {
+            "version": "v2",
+            "content": {
+                "messages": [{"type": "text", "text": "❌ 상품 정보를 찾을 수 없습니다."}]
+            }
+        }
+
+    options_raw = product.get("조합형옵션", "")
+    if not options_raw or options_raw.lower() in ["nan", ""]:
+        # ✅ 단일 옵션 상품일 경우 바로 다음 플로우로 이동
+        headers = {
+            "Authorization": f"Bearer {MANYCHAT_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        flow_payload = {
+            "subscriber_id": sender_id,
+            "flow_ns": "content20250424050612_308842"
+        }
+        res = requests.post(
+            "https://api.manychat.com/fb/sending/sendFlow",
+            headers=headers,
+            json=flow_payload
+        )
+        print("✅ 단일 옵션 상품 - Flow 전송 결과:", res.json())
+
+        return {
+            "version": "v2",
+            "content": {
+                "messages": [{"type": "text", "text": "단일 옵션 상품입니다. 수량을 선택해주세요."}]
+            }
+        }
+
+    options = options_raw.strip().split("\n")
+    start_idx = (page - 1) * 27
+    end_idx = start_idx + 27
+    paged_options = options[start_idx:end_idx]
+
+    message_batches = []
+    current_buttons = []
+
+    for opt in paged_options:
+        try:
+            name, extra_price, stock = opt.split(",")
+            caption = f"{name.strip()} (+{int(float(extra_price)):,}원)" if float(extra_price) > 0 else name.strip()
+
+            current_buttons.append({
+                "type": "dynamic_block_callback",
+                "caption": caption,
+                "url": "https://viable-shark-faithful.ngrok-free.app/manychat-option-select",
+                "method": "post",
+                "headers": {"Content-Type": "application/json"},
+                "payload": {
+                    "sender_id": sender_id,
+                    "selected_option": caption
+                }
+            })
+
+            if len(current_buttons) == 3:
+                message_batches.append({
+                    "type": "text",
+                    "text": "옵션을 선택해주세요:",
+                    "buttons": current_buttons
+                })
+                current_buttons = []
+
+        except Exception as e:
+            print(f"⚠️ 옵션 파싱 실패: {opt} → {e}")
+            continue
+
+    if current_buttons:
+        message_batches.append({
+            "type": "text",
+            "text": "옵션을 선택해주세요:",
+            "buttons": current_buttons
+        })
+
+    # 다음 페이지 버튼 추가
+    if end_idx < len(options):
+        message_batches.append({
+            "type": "text",
+            "text": "다음 옵션을 보시겠습니까?",
+            "buttons": [
+                {
+                    "type": "dynamic_block_callback",
+                    "caption": "다음 옵션 보기",
+                    "url": "https://viable-shark-faithful.ngrok-free.app/manychat-option-request",
+                    "method": "post",
+                    "headers": {"Content-Type": "application/json"},
+                    "payload": {
+                        "version": "v2",
+                        "field": "messages",
+                        "value": {
+                            "sender_id": sender_id,
+                            "product_code": product_code
+                        },
+                        "page": page + 1
+                    }
+                }
+            ]
+        })
+
+    return {
+        "version": "v2",
+        "content": {
+            "messages": message_batches
+        }
+    }
+
+
+@app.post("/manychat-option-select")
+def handle_option_selection(payload: dict):
+    sender_id = payload.get("sender_id")
+    selected_option = payload.get("selected_option")
+
+    if not sender_id or not selected_option:
+        return {
+            "version": "v2",
+            "content": {
+                "messages": [{"type": "text", "text": "❌ sender_id 또는 selected_option이 없습니다."}]
+            }
+        }
+
+    # ✅ 추가금액 추출
+    extra_price = 0
+    match = re.search(r'\(\+([\d,]+)원\)', selected_option)
+    if match:
+        try:
+            extra_price = int(match.group(1).replace(",", ""))
+        except:
+            extra_price = 0
+
+    updater = ManychatFieldUpdater(sender_id, MANYCHAT_API_KEY)
+    updater.set_product_selection_option("12904981", selected_option)
+    updater.set_extra_price("12911810", extra_price)
+
+    # ✅ 옵션 저장 후 Flow로 이동시키기
+    headers = {
+        "Authorization": f"Bearer {MANYCHAT_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    flow_payload = {
+        "subscriber_id": sender_id,
+        "flow_ns": "content20250424050612_308842"
+    }
+    res2 = requests.post(
+        "https://api.manychat.com/fb/sending/sendFlow",
+        headers=headers,
+        json=flow_payload
+    )
+    print("✅ ManyChat Flow 전송 결과:", res2.json())
+
+    return {
+        "version": "v2",
+        "content": {
+            "messages": [
+                {
+                    "type": "text",
+                    "text": f"✅ 옵션이 선택되었습니다: {selected_option} (추가금액: {extra_price:,}원)"
+                }
+            ]
+        }
+    }
 # ✅ 루트 경로 - HTML 페이지 렌더링
 @app.get("/", response_class=HTMLResponse)
 async def serve_home(request: Request):
@@ -1064,7 +1354,7 @@ def search_and_generate_response(request: QueryRequest):
         session_history.add_message(HumanMessage(content=query))
         print(f"�� Redis 메시지 기록 (변경된 상태): {session_history.messages}")
 
-        _, data = load_excel_to_texts("db/ownerclan_주간인기상품_5만개.xlsx")
+        _, data = load_excel_to_texts("db/ownerclan_주간인기상품_0428.xlsx")
 
         # ✅ OpenAI 임베딩 생성
         query_embedding = embed_texts_parallel([combined_keywords], EMBEDDING_MODEL)
