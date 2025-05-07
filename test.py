@@ -1,6 +1,7 @@
 import pandas as pd
 from fastapi import HTTPException
 
+
 # ✅ 엑셀 데이터 로드 및 변환 (본문상세설명 컬럼 제외하고 임베딩용 텍스트 생성)
 def load_excel_to_texts(file_path):
     try:
@@ -27,5 +28,5 @@ def load_excel_to_texts(file_path):
 
 # 테스트용 코드 (직접 실행할 수 있음)
 if __name__ == "__main__":
-    file_path = "db/ownerclan_주간인기상품_5만개.xlsx"  # 실제 파일 경로에 맞게 조정
+    file_path = "db/ownerclan_주간인기상품_0428.xlsx"  # 실제 파일 경로에 맞게 조정
     load_excel_to_texts(file_path)
