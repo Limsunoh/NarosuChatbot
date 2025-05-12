@@ -1,10 +1,14 @@
 import asyncio
+import base64
 import json
 import logging
 import os
+import re
 import time
+import urllib
 from concurrent.futures import ThreadPoolExecutor
-from typing import Union, Optional
+from typing import Optional, Union
+from urllib.parse import quote
 
 import faiss
 import numpy as np
@@ -12,13 +16,8 @@ import pandas as pd
 import redis
 import requests
 import uvicorn
-import base64
-import urllib
-import re
-
-from urllib.parse import quote
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, APIRouter
+from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
@@ -42,13 +41,16 @@ REDIS_URL = "redis://localhost:6379/0"
 VERIFY_TOKEN = os.getenv('VERIFY_TOKEN')
 PAGE_ACCESS_TOKEN = os.getenv('PAGE_ACCESS_TOKEN')
 MANYCHAT_API_KEY = os.getenv('MANYCHAT_API_KEY')
+key = os.getenv("MANYCHAT_API_KEY")
+if "\x3a" in key:
+    key = key.replace("\x3a", ":")
 
 print(f"🔍 로드된 VERIFY_TOKEN: {VERIFY_TOKEN}")
 print(f"🔍 로드된 PAGE_ACCESS_TOKEN: {PAGE_ACCESS_TOKEN}")
 print(f"🔍 로드된 API_KEY: {API_KEY}")
 
 # ✅ FAISS 인덱스 파일 경로 설정
-faiss_file_path = f"04_03_faiss_3s.faiss"
+faiss_file_path = f"04_28_faiss_3s.faiss"
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 
@@ -70,6 +72,7 @@ app.add_middleware(
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("response_time_logger")
+print(f"🔐 API KEY: {MANYCHAT_API_KEY}")
 
 
 # 응답 속도 측정을 위한 미들웨어 추가
@@ -206,7 +209,7 @@ def create_and_save_faiss_index(file_path):
 def initialize_faiss_index():
     if not os.path.exists(faiss_file_path):
         # 현재 디렉토리의 'db' 폴더 안에서 엑셀 파일을 검색
-        file_path = os.path.join(os.getcwd(), "db", "ownerclan_주간인기상품_5만개.xlsx")
+        file_path = os.path.join(os.getcwd(), "db", "ownerclan_주간인기상품_0428.xlsx")
         
         # 🔍 엑셀 데이터 로드 확인
         texts, data = load_excel_to_texts(file_path)
@@ -601,7 +604,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         # ✅ [Step 7] 엑셀 데이터 로드
         excel_start = time.time()
         try:
-            _, data = load_excel_to_texts("db/ownerclan_주간인기상품_5만개.xlsx")
+            _, data = load_excel_to_texts("db/ownerclan_주간인기상품_0428.xlsx")
         except Exception as e:
             raise ValueError(f"❌ [ERROR] 엑셀 데이터 로딩 실패: {e}")
 
@@ -703,7 +706,8 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                         "원산지": result_row.get("원산지", "정보 없음"),
                         "상품링크": product_link,
                         "옵션": option_display,
-                        "조합형옵션": option_raw
+                        "조합형옵션": option_raw,
+                        "최대구매수량": convert_to_serializable(result_row.get("최대구매수량", 0))
                     }
                     results.append(result_info)
                     
@@ -918,6 +922,9 @@ class ManychatFieldUpdater:
     
     def set_extra_price(self, field_id: str, extra_price: int):
         self.set_field(field_id, extra_price)
+    
+    def set_product_max_quantity(self, field_id: str, max_quantity: int):
+        self.set_field(field_id, max_quantity)
 
 
 class Product_Selections(BaseModel):
@@ -932,25 +939,27 @@ def handle_product_selection(data: Product_Selections):
         product_code = data.product_code
 
         if not sender_id or not product_code:
-            return {"detail": "sender_id 또는 product_code가 없습니다."}
+            return {
+                "version": "v2",
+                "content": {
+                    "messages": [{"type": "text", "text": "❌ sender_id 또는 product_code가 없습니다."}]
+                }
+            }
 
         product = PRODUCT_CACHE.get(product_code)
         if not product:
-            return {"detail": f"상품코드 {product_code}에 대한 정보를 찾을 수 없습니다."}
+            return {
+                "version": "v2",
+                "content": {
+                    "messages": [{"type": "text", "text": f"❌ 상품코드 {product_code}에 대한 정보를 찾을 수 없습니다."}]
+                }
+            }
 
-        # 🎯 가격 계산
-        try:
-            price = int(float(product.get("가격", 0)))
-        except:
-            price = 0
-        try:
-            shipping = int(float(product.get("배송비", 0)))
-        except:
-            shipping = 0
-        total_price = price + shipping
-
-        # 🎯 옵션 정리 (조합형옵션을 보기 좋게 파싱)
+        # 가격, 옵션 정리
+        price = int(float(product.get("가격", 0) or 0))
+        shipping = int(float(product.get("배송비", 0) or 0))
         option_raw = product.get("조합형옵션", "").strip()
+
         option_display = "없음"
         if option_raw and option_raw.lower() != "nan":
             option_lines = option_raw.splitlines()
@@ -961,11 +970,40 @@ def handle_product_selection(data: Product_Selections):
                     extra_price = int(float(extra_price))
                     price_str = f"(+{extra_price:,}원)" if extra_price > 0 else ""
                     parsed_options.append(f"{name.strip()} {price_str}".strip())
-                except Exception as e:
+                except Exception:
                     parsed_options.append(line.strip())
             option_display = "\n".join(parsed_options)
 
-        # ✅ 메시지 구성 (ManyChat 스타일)
+        # ✅ Manychat Field 업데이트
+        updater = ManychatFieldUpdater(sender_id, MANYCHAT_API_KEY)
+        updater.set_unique_code("12886380", product.get('상품코드'))
+        updater.set_product_name("12886273", product.get('제목'))
+        updater.set_option("12886363", option_display)
+        updater.set_price("12890668", price)
+        updater.set_shipping("12890670", shipping)
+        updater.set_product_max_quantity("12922068", product.get('최대구매수량'))
+
+        # ✅ 외부 Flow 트리거 (비동기처럼 요청 보내기)
+        headers = {
+            "Authorization": f"Bearer {MANYCHAT_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        flow_payload = {
+            "subscriber_id": sender_id,
+            "flow_ns": "content20250417015933_369132"
+        }
+        try:
+            res = requests.post(
+                "https://api.manychat.com/fb/sending/sendFlow",
+                headers=headers,
+                json=flow_payload,
+                timeout=5  # 실패해도 바로 리턴 안 끌려가게
+            )
+            print("✅ ManyChat Flow 전송 결과:", res.json())
+        except Exception as e:
+            print(f"❌ Flow 전송 실패: {e}")
+
+        # ✅ 최종 클라이언트 응답 (Manychat Dynamic Block 규격)
         info_message = (
             f"상품코드\n{product.get('상품코드', '없음')}\n"
             f"제목\n{product.get('제목', '없음')}\n"
@@ -973,71 +1011,33 @@ def handle_product_selection(data: Product_Selections):
             f"------------------------------------------\n"
             f"가격\n{price:,}원\n"
             f"배송비\n{shipping:,}원\n"
+            f"묶음배송수량\n{product.get('최대구매수량','0')}개\n"
             f"------------------------------------------\n"
             f"옵션\n{option_display}\n"
-            f"------------------------------------------\n"
-
+            f"------------------------------------------"
         ).strip()
-        
-        updater = ManychatFieldUpdater(sender_id, MANYCHAT_API_KEY)
 
-        updater.set_unique_code("12886380", product.get('상품코드'))
-        updater.set_product_name("12886273", product.get('제목'))
-        updater.set_option("12886363", option_display)
-        updater.set_price("12890668", price)      
-        updater.set_shipping("12890670", shipping)
-
-        # ✅ sendContent API 전송 형식
-        content_payload = {
-            "subscriber_id": sender_id,
-            "data": {
-                "version": "v2",
-                "content": {
-                    "messages": [
-                        {
-                            "type": "text",
-                            "text": info_message
-                        }
-                    ],
-                    "actions": [],
-                    "quick_replies": []
-                }
-            },
-            "message_tag": "ACCOUNT_UPDATE"
+        return {
+            "version": "v2",
+            "content": {
+                "messages": [
+                    {
+                        "type": "text",
+                        "text": info_message
+                    }
+                ]
+            }
         }
-
-        headers = {
-            "Authorization": f"Bearer {MANYCHAT_API_KEY}",
-            "Content-Type": "application/json"
-        }
-
-        res1 = requests.post(
-            "https://api.manychat.com/fb/sending/sendContent",
-            headers=headers,
-            json=content_payload
-        )
-        print("✅ 메시지 전송 결과:", res1.json())
-        print(f"📏 메시지 길이: {len(info_message)}자")
-        print(f"📦 메시지 내용:\n{info_message}")
-
-        # ✅ Flow 트리거
-        flow_payload = {
-            "subscriber_id": sender_id,
-            "flow_ns": "content20250417015933_369132"
-        }
-
-        res2 = requests.post(
-            "https://api.manychat.com/fb/sending/sendFlow",
-            headers=headers,
-            json=flow_payload
-        )
-        print("✅ ManyChat Flow 전송 결과:", res2.json())
-
-        return {"status": "ok", "detail": "상품 메시지 및 플로우 전송 완료"}
 
     except Exception as e:
         print(f"❌ 상품 선택 처리 오류: {e}")
-        return {"detail": f"서버 오류 발생: {str(e)}"}
+        return {
+            "version": "v2",
+            "content": {
+                "messages": [{"type": "text", "text": f"❌ 서버 오류 발생: {str(e)}"}]
+            }
+        }
+
 
 
 class Option_Selections(BaseModel):
@@ -1053,21 +1053,45 @@ def handle_option_request(data: Option_Selections):
     product_code = data.value.get("product_code") if isinstance(data.value, dict) else None
     page = data.page or 1
 
+    if not sender_id or not product_code:
+        return {
+            "version": "v2",
+            "content": {
+                "messages": [{"type": "text", "text": "❌ sender_id 또는 product_code가 없습니다."}]
+            }
+        }
+
     product = PRODUCT_CACHE.get(product_code)
     if not product:
         return {
             "version": "v2",
             "content": {
-                "messages": [{"type": "text", "text": "상품 정보를 찾을 수 없습니다."}]
+                "messages": [{"type": "text", "text": "❌ 상품 정보를 찾을 수 없습니다."}]
             }
         }
 
     options_raw = product.get("조합형옵션", "")
     if not options_raw or options_raw.lower() in ["nan", ""]:
+        # ✅ 단일 옵션 상품일 경우 바로 다음 플로우로 이동
+        headers = {
+            "Authorization": f"Bearer {MANYCHAT_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        flow_payload = {
+            "subscriber_id": sender_id,
+            "flow_ns": "content20250424050612_308842"
+        }
+        res = requests.post(
+            "https://api.manychat.com/fb/sending/sendFlow",
+            headers=headers,
+            json=flow_payload
+        )
+        print("✅ 단일 옵션 상품 - Flow 전송 결과:", res.json())
+
         return {
             "version": "v2",
             "content": {
-                "messages": [{"type": "text", "text": "단일 옵션 상품입니다. 수량만 선택해주세요."}]
+                "messages": [{"type": "text", "text": "단일 옵션 상품입니다. 수량을 선택해주세요."}]
             }
         }
 
@@ -1154,7 +1178,12 @@ def handle_option_selection(payload: dict):
     selected_option = payload.get("selected_option")
 
     if not sender_id or not selected_option:
-        return {"detail": "sender_id 또는 selected_option이 없습니다."}
+        return {
+            "version": "v2",
+            "content": {
+                "messages": [{"type": "text", "text": "❌ sender_id 또는 selected_option이 없습니다."}]
+            }
+        }
 
     # ✅ 추가금액 추출
     extra_price = 0
@@ -1169,6 +1198,22 @@ def handle_option_selection(payload: dict):
     updater.set_product_selection_option("12904981", selected_option)
     updater.set_extra_price("12911810", extra_price)
 
+    # ✅ 옵션 저장 후 Flow로 이동시키기
+    headers = {
+        "Authorization": f"Bearer {MANYCHAT_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    flow_payload = {
+        "subscriber_id": sender_id,
+        "flow_ns": "content20250424050612_308842"
+    }
+    res2 = requests.post(
+        "https://api.manychat.com/fb/sending/sendFlow",
+        headers=headers,
+        json=flow_payload
+    )
+    print("✅ ManyChat Flow 전송 결과:", res2.json())
+
     return {
         "version": "v2",
         "content": {
@@ -1180,8 +1225,6 @@ def handle_option_selection(payload: dict):
             ]
         }
     }
-
-
 # ✅ 루트 경로 - HTML 페이지 렌더링
 @app.get("/", response_class=HTMLResponse)
 async def serve_home(request: Request):
@@ -1307,7 +1350,7 @@ def search_and_generate_response(request: QueryRequest):
         session_history.add_message(HumanMessage(content=query))
         print(f"�� Redis 메시지 기록 (변경된 상태): {session_history.messages}")
 
-        _, data = load_excel_to_texts("db/ownerclan_주간인기상품_5만개.xlsx")
+        _, data = load_excel_to_texts("db/ownerclan_주간인기상품_0428.xlsx")
 
         # ✅ OpenAI 임베딩 생성
         query_embedding = embed_texts_parallel([combined_keywords], EMBEDDING_MODEL)
