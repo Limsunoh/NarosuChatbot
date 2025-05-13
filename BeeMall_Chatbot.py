@@ -41,6 +41,9 @@ REDIS_URL = "redis://localhost:6379/0"
 VERIFY_TOKEN = os.getenv('VERIFY_TOKEN')
 PAGE_ACCESS_TOKEN = os.getenv('PAGE_ACCESS_TOKEN')
 MANYCHAT_API_KEY = os.getenv('MANYCHAT_API_KEY')
+key = os.getenv("MANYCHAT_API_KEY")
+if "\x3a" in key:
+    key = key.replace("\x3a", ":")
 
 print(f"🔍 로드된 VERIFY_TOKEN: {VERIFY_TOKEN}")
 print(f"🔍 로드된 PAGE_ACCESS_TOKEN: {PAGE_ACCESS_TOKEN}")
@@ -69,6 +72,7 @@ app.add_middleware(
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("response_time_logger")
+print(f"🔐 API KEY: {MANYCHAT_API_KEY}")
 
 
 # 응답 속도 측정을 위한 미들웨어 추가
