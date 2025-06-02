@@ -2,7 +2,6 @@ import asyncio
 import base64
 import json
 import logging
-import math
 import os
 import re
 import time
@@ -42,11 +41,13 @@ REDIS_URL = "redis://localhost:6379/0"
 VERIFY_TOKEN = os.getenv('VERIFY_TOKEN')
 PAGE_ACCESS_TOKEN = os.getenv('PAGE_ACCESS_TOKEN')
 MANYCHAT_API_KEY = os.getenv('MANYCHAT_API_KEY')
+key = os.getenv("MANYCHAT_API_KEY")
+if "\x3a" in key:
+    key = key.replace("\x3a", ":")
 
 print(f"🔍 로드된 VERIFY_TOKEN: {VERIFY_TOKEN}")
 print(f"🔍 로드된 PAGE_ACCESS_TOKEN: {PAGE_ACCESS_TOKEN}")
 print(f"🔍 로드된 API_KEY: {API_KEY}")
-print(f"🔍 로드된 MANYCHAT_API_KEY: {MANYCHAT_API_KEY}")
 
 # ✅ FAISS 인덱스 파일 경로 설정
 faiss_file_path = f"04_28_faiss_3s.faiss"
@@ -81,7 +82,7 @@ async def measure_response_time(request: Request, call_next):
     response = await call_next(request)  # 요청 처리
     process_time = time.time() - start_time  # 처리 시간 계산
 
-    response.headers["ngrok-skip-browser-warning"] = "1"
+    response.headers["ngrok-skip-browser-warning"] = "true"
     response.headers["X-Frame-Options"] = "ALLOWALL"  # 또는 제거 방식도 가능 #BeeMall 챗봇 Iframe 막히는것 때문에 헤더 추가가
     response.headers["Content-Security-Policy"] = "frame-ancestors *" #BeeMall 챗봇 Iframe 막히는것 때문에 헤더 추가가
 
@@ -247,7 +248,7 @@ def extract_keywords_with_llm(query):
         llm = ChatOpenAI(model="gpt-4o-mini", openai_api_key=API_KEY)
 
         print(f"🔍 [Step 2] LLM API 호출 시작...")
-        print("💬 llm.invoke 직전")
+
         # 기존 대화 이력과 함께 LLM에 전달
         response = llm.invoke([
             SystemMessage(content="""
@@ -291,7 +292,6 @@ def extract_keywords_with_llm(query):
             """),
             HumanMessage(content=f"{query}")
         ])
-        print("✅ llm.invoke 호출 성공")
         
 
         print(f"✅ [Step 4] LLM 응답 확인: {response}")
@@ -420,10 +420,7 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
                         "version": "v2",
                         "content": {
                             "messages": [
-                                {
-                                    "type": "text",
-                                    "text": f"🔄 Chat reset complete!\n💬 Enter a keyword and let the AI work its magic 🛍️."
-                                }
+                                {"type": "text", "text": f"✅ 세션 {sender_id}의 대화 기록이 초기화되었습니다!"}
                             ]
                         },
                         "message": f"세션 {sender_id}의 대화 기록이 초기화되었습니다."
@@ -440,10 +437,7 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
             "version": "v2",
             "content": {
                 "messages": [
-                    {
-                        "type": "text",
-                        "text": "🛍️ Just a moment, smart picks coming soon! ⏳"
-                    }
+                    {"type": "text", "text": "입력이 완료 되어 AI가 생각중입니다.."}
                 ]
             }
         }
@@ -510,12 +504,12 @@ async def process_ai_response(sender_id: str, user_message: str):
                     "buttons": [
                         {
                             "type": "url",
-                            "caption": "🤩 View Product 🧾",
+                            "caption": "상품 보러가기",
                             "url": product.get("상품링크", "#")
                         },
                         {
                             "type": "dynamic_block_callback",
-                            "caption": "🛍️ Buy Now 💰",
+                            "caption": "구매하기",
                             "url": "https://viable-shark-faithful.ngrok-free.app/product-select",
                             "method": "post",
                             "payload": {
@@ -548,7 +542,7 @@ async def process_ai_response(sender_id: str, user_message: str):
 def clean_html_content(html_raw: str) -> str:
     try:
         html_cleaned = html_raw.replace('\n', '').replace('\r', '')
-        html_cleaned = html_cleaned.replace(""", "\"").replace(""", "\"").replace("'", "'").replace("'", "'")
+        html_cleaned = html_cleaned.replace("“", "\"").replace("”", "\"").replace("‘", "'").replace("’", "'")
         if html_cleaned.count("<center>") > html_cleaned.count("</center>"):
             html_cleaned += "</center>"
         if html_cleaned.count("<p") > html_cleaned.count("</p>"):
@@ -757,7 +751,6 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         prompt = ChatPromptTemplate.from_messages([
             ("system", """
         당신은 쇼핑몰 챗봇으로, 친절하고 인간적인 대화를 통해 고객의 쇼핑 경험을 돕습니다.
-        사용자의 언어에 맞게 번역해서 답변하세요(예시: 한국어->한국어, 영어->영어, 베트남어->베트남어 등)
 
         🎯 목표:
         - 사용자의 요구를 이해하고 대화의 맥락을 반영하여 적합한 상품을 추천합니다.
@@ -886,6 +879,12 @@ def send_message(sender_id: str, messages: list):
             response = requests.post(url, headers=headers, json=data)
             print(f"✅ [카드 메시지 전송]: {response.json()}")
 
+        '''# ✅ 전체 텍스트 Custom Field 저장 (선택)
+        all_texts = "\n\n".join(
+            [msg["text"] for msg in messages if msg.get("type") == "text"]
+        )
+        set_custom_field(sender_id, all_texts)'''
+
     except Exception as e:
         print(f"❌ ManyChat 메시지 전송 오류: {e}")
 
@@ -934,12 +933,6 @@ class ManychatFieldUpdater:
     
     def set_product_max_quantity(self, field_id: str, max_quantity: int):
         self.set_field(field_id, max_quantity)
-        
-    def set_quantity(self, field_id: str, quantity: int):
-        self.set_field(field_id, quantity)
-
-    def set_total_price(self, field_id: str, total_price: int):
-        self.set_field(field_id, total_price)
 
 
 class Product_Selections(BaseModel):
@@ -969,7 +962,7 @@ def handle_product_selection(data: Product_Selections):
                     "messages": [{"type": "text", "text": f"❌ 상품코드 {product_code}에 대한 정보를 찾을 수 없습니다."}]
                 }
             }
-        
+
         # 가격, 옵션 정리
         price = int(float(product.get("가격", 0) or 0))
         shipping = int(float(product.get("배송비", 0) or 0))
@@ -988,9 +981,7 @@ def handle_product_selection(data: Product_Selections):
                 except Exception:
                     parsed_options.append(line.strip())
             option_display = "\n".join(parsed_options)
-        
-        product["sender_id"] = sender_id
-        
+
         # ✅ Manychat Field 업데이트
         updater = ManychatFieldUpdater(sender_id, MANYCHAT_API_KEY)
         updater.set_unique_code("12886380", product.get('상품코드'))
@@ -1108,7 +1099,7 @@ def handle_option_request(data: Option_Selections):
         return {
             "version": "v2",
             "content": {
-                "messages": [{"type": "text", "text": "🧾 This item has a single option — please select the quantity."}]
+                "messages": [{"type": "text", "text": "단일 옵션 상품입니다. 수량을 선택해주세요."}]
             }
         }
 
@@ -1130,9 +1121,7 @@ def handle_option_request(data: Option_Selections):
                 "caption": caption,
                 "url": "https://viable-shark-faithful.ngrok-free.app/manychat-option-select",
                 "method": "post",
-                "headers": {
-                    "Content-Type": "application/json"
-                    },
+                "headers": {"Content-Type": "application/json"},
                 "payload": {
                     "sender_id": sender_id,
                     "selected_option": caption
@@ -1142,7 +1131,7 @@ def handle_option_request(data: Option_Selections):
             if len(current_buttons) == 3:
                 message_batches.append({
                     "type": "text",
-                    "text": "📌 Pick your preferred option:",
+                    "text": "옵션을 선택해주세요:",
                     "buttons": current_buttons
                 })
                 current_buttons = []
@@ -1154,7 +1143,7 @@ def handle_option_request(data: Option_Selections):
     if current_buttons:
         message_batches.append({
             "type": "text",
-            "text": "📌 Pick your preferred option:",
+            "text": "옵션을 선택해주세요:",
             "buttons": current_buttons
         })
 
@@ -1162,16 +1151,14 @@ def handle_option_request(data: Option_Selections):
     if end_idx < len(options):
         message_batches.append({
             "type": "text",
-            "text": "👀 View Next Option 🧾",
+            "text": "다음 옵션을 보시겠습니까?",
             "buttons": [
                 {
                     "type": "dynamic_block_callback",
-                    "caption": "👀 View Next Option 🧾",
+                    "caption": "다음 옵션 보기",
                     "url": "https://viable-shark-faithful.ngrok-free.app/manychat-option-request",
                     "method": "post",
-                    "headers": {
-                        "Content-Type": "application/json"
-                        },
+                    "headers": {"Content-Type": "application/json"},
                     "payload": {
                         "version": "v2",
                         "field": "messages",
@@ -1241,92 +1228,11 @@ def handle_option_selection(payload: dict):
             "messages": [
                 {
                     "type": "text",
-                    "text": f"✅ Option selected: {selected_option} (Extra: {extra_price:,})원)"
+                    "text": f"✅ 옵션이 선택되었습니다: {selected_option} (추가금액: {extra_price:,}원)"
                 }
             ]
         }
     }
-
-class QuantityInput(BaseModel):
-    sender_id: str
-    product_quantity: int
-
-
-def safe_int(val):
-    try:
-        return int(float(str(val).replace(",", "").replace("원", "").strip()))
-    except:
-        return 0
-
-
-@app.post("/calculate_payment")
-def calculate_payment(data: QuantityInput):
-    try:
-        sender_id = data.sender_id
-        quantity = data.product_quantity
-
-        if not sender_id or quantity is None:
-            raise ValueError("❌ sender_id 또는 product_quantity 누락됨")
-
-        # 🔍 캐시에서 상품 정보 불러오기
-        product = None
-        for p in PRODUCT_CACHE.values():
-            if p.get("sender_id") == sender_id:
-                product = p
-                break
-
-        if not product:
-            raise ValueError("❌ 해당 유저의 상품 정보가 존재하지 않습니다.")
-
-        # 🔢 기본 정보 추출
-        price = safe_int(float(product.get("가격", 0)))
-        extra_price = safe_int(float(product.get("추가금액", 0))) if "추가금액" in product else 0
-        shipping = safe_int(float(product.get("배송비", 0)))
-        max_quantity = safe_int(float(product.get("최대구매수량", 0)))
-
-        # ✅ 총 가격 계산
-        total_price = (price + extra_price) * quantity
-        if max_quantity == 0:
-            shipping_cost = shipping
-        else:
-            shipping_cost = shipping * math.ceil(quantity / max_quantity)
-
-        total_price += shipping_cost
-
-        # ✅ 천 단위 구분을 위한 포맷팅
-        formatted_total_price = "{:,}".format(total_price)
-        print(f"✅ 계산 완료 → 총금액: {formatted_total_price}원 (수량: {quantity}, 배송비: {shipping_cost:,}원)")
-
-        # ✅ Manychat 필드 업데이트
-        updater = ManychatFieldUpdater(sender_id, MANYCHAT_API_KEY)
-        updater.set_quantity("12911653", quantity)  # Product_quantity 필드 ID
-        updater.set_total_price("13013393", formatted_total_price)  # Total_price 필드 ID - 포맷팅된 값으로 저장
-
-        # ✅ ManyChat 다음 Flow로 이동
-        headers = {
-            "Authorization": f"Bearer {MANYCHAT_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        flow_payload = {
-            "subscriber_id": sender_id,
-            "flow_ns": "content20250501040123_213607"
-        }
-        res = requests.post(
-            "https://api.manychat.com/fb/sending/sendFlow",
-            headers=headers,
-            json=flow_payload
-        )
-        print("✅ 최종결제금액 전송완료:", res.json())
-
-        return {
-            "Product_quantity": quantity,
-            "Total_price": total_price
-        }
-
-    except Exception as e:
-        print(f"❌ 결제 금액 계산 오류: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 # ✅ 루트 경로 - HTML 페이지 렌더링
 @app.get("/", response_class=HTMLResponse)
 async def serve_home(request: Request):
