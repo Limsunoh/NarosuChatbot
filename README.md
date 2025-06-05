@@ -8,4 +8,6 @@
 
 # ngrok http --url=viable-shark-faithful.ngrok-free.app 5050
 # (선오 ngork 개인 도메인주소)
+
+
 # Python 은 3.8.20

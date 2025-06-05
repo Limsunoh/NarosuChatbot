@@ -998,7 +998,7 @@ def handle_product_selection(data: Product_Selections):
         }
         flow_payload = {
             "subscriber_id": sender_id,
-            "flow_ns": "content20250417015933_369132"
+            "flow_ns": "content20250604080355_172315"
         }
         try:
             res = requests.post(
@@ -1087,7 +1087,7 @@ def handle_option_request(data: Option_Selections):
         }
         flow_payload = {
             "subscriber_id": sender_id,
-            "flow_ns": "content20250424050612_308842"
+            "flow_ns": "content20250424050612_308842"content20250424050612_308842
         }
         res = requests.post(
             "https://api.manychat.com/fb/sending/sendFlow",
@@ -1213,7 +1213,7 @@ def handle_option_selection(payload: dict):
     }
     flow_payload = {
         "subscriber_id": sender_id,
-        "flow_ns": "content20250424050612_308842"
+        "flow_ns": "content20250605003906_502539"
     }
     res2 = requests.post(
         "https://api.manychat.com/fb/sending/sendFlow",
@@ -1233,6 +1233,89 @@ def handle_option_selection(payload: dict):
             ]
         }
     }
+
+
+class QuantityInput(BaseModel):
+    sender_id: str
+    product_quantity: int
+
+
+def safe_int(val):
+    try:
+        return int(float(str(val).replace(",", "").replace("원", "").strip()))
+    except:
+        return 0
+
+
+@app.post("/calculate_payment")
+def calculate_payment(data: QuantityInput):
+    try:
+        sender_id = data.sender_id
+        quantity = data.product_quantity
+
+        if not sender_id or quantity is None:
+            raise ValueError("❌ sender_id 또는 product_quantity 누락됨")
+
+        # 🔍 캐시에서 상품 정보 불러오기
+        product = None
+        for p in PRODUCT_CACHE.values():
+            if p.get("sender_id") == sender_id:
+                product = p
+                break
+
+        if not product:
+            raise ValueError("❌ 해당 유저의 상품 정보가 존재하지 않습니다.")
+
+        # 🔢 기본 정보 추출
+        price = safe_int(float(product.get("가격", 0)))
+        extra_price = safe_int(float(product.get("추가금액", 0))) if "추가금액" in product else 0
+        shipping = safe_int(float(product.get("배송비", 0)))
+        max_quantity = safe_int(float(product.get("최대구매수량", 0)))
+
+        # ✅ 총 가격 계산
+        total_price = (price + extra_price) * quantity
+        if max_quantity == 0:
+            shipping_cost = shipping
+        else:
+            shipping_cost = shipping * math.ceil(quantity / max_quantity)
+
+        total_price += shipping_cost
+
+        # ✅ 천 단위 구분을 위한 포맷팅
+        formatted_total_price = "{:,}".format(total_price)
+        print(f"✅ 계산 완료 → 총금액: {formatted_total_price}원 (수량: {quantity}, 배송비: {shipping_cost:,}원)")
+
+        # ✅ Manychat 필드 업데이트
+        updater = ManychatFieldUpdater(sender_id, MANYCHAT_API_KEY)
+        updater.set_quantity("12911653", quantity)  # Product_quantity 필드 ID
+        updater.set_total_price("13013393", formatted_total_price)  # Total_price 필드 ID - 포맷팅된 값으로 저장
+
+        # ✅ ManyChat 다음 Flow로 이동
+        headers = {
+            "Authorization": f"Bearer {MANYCHAT_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        flow_payload = {
+            "subscriber_id": sender_id,
+            "flow_ns": "content20250605012240_150101"
+        }
+        res = requests.post(
+            "https://api.manychat.com/fb/sending/sendFlow",
+            headers=headers,
+            json=flow_payload
+        )
+        print("✅ 최종결제금액 전송완료:", res.json())
+
+        return {
+            "Product_quantity": quantity,
+            "Total_price": total_price
+        }
+
+    except Exception as e:
+        print(f"❌ 결제 금액 계산 오류: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ✅ 루트 경로 - HTML 페이지 렌더링
 @app.get("/", response_class=HTMLResponse)
 async def serve_home(request: Request):
