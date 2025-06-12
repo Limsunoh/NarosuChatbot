@@ -9,6 +9,7 @@ import urllib
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Union
 from urllib.parse import quote
+import math
 
 import faiss
 import numpy as np
@@ -32,6 +33,12 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from pydantic import BaseModel
 
+from pymilvus import (
+    connections, utility,
+    FieldSchema, CollectionSchema,
+    DataType, Collection
+)
+
 executor = ThreadPoolExecutor()
 
 # ✅ 환경 변수 로드
@@ -42,12 +49,17 @@ VERIFY_TOKEN = os.getenv('VERIFY_TOKEN')
 PAGE_ACCESS_TOKEN = os.getenv('PAGE_ACCESS_TOKEN')
 MANYCHAT_API_KEY = os.getenv('MANYCHAT_API_KEY')
 key = os.getenv("MANYCHAT_API_KEY")
-if "\x3a" in key:
+if isinstance(key, str) and "\x3a" in key:
     key = key.replace("\x3a", ":")
 
+
+
+# API_URL = os.getenv("API_URL", "").rstrip("/")  # 예: http://114.110.135.96:8011
+API_URL = "https://fb-narosu.duckdns.org"  # 예: http://114.110.135.96:8011
 print(f"🔍 로드된 VERIFY_TOKEN: {VERIFY_TOKEN}")
 print(f"🔍 로드된 PAGE_ACCESS_TOKEN: {PAGE_ACCESS_TOKEN}")
 print(f"🔍 로드된 API_KEY: {API_KEY}")
+print(f"🔍 로드된 API_URL: {API_URL}")
 
 # ✅ FAISS 인덱스 파일 경로 설정
 faiss_file_path = f"04_28_faiss_3s.faiss"
@@ -61,7 +73,8 @@ def get_redis():
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5050",
+    allow_origins=[API_URL,  # 실제 배포 URL
+                  "http://localhost:5050",
                    "https://satyr-inviting-quetzal.ngrok-free.app", 
                    "https://viable-shark-faithful.ngrok-free.app"],  # 외부 도메인 추가
     allow_credentials=True,
@@ -74,7 +87,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("response_time_logger")
 print(f"🔐 API KEY: {MANYCHAT_API_KEY}")
 
-
 # 응답 속도 측정을 위한 미들웨어 추가
 @app.middleware("http")
 async def measure_response_time(request: Request, call_next):
@@ -82,7 +94,7 @@ async def measure_response_time(request: Request, call_next):
     response = await call_next(request)  # 요청 처리
     process_time = time.time() - start_time  # 처리 시간 계산
 
-    response.headers["ngrok-skip-browser-warning"] = "true"
+    response.headers["ngrok-skip-browser-warning"] = "1"
     response.headers["X-Frame-Options"] = "ALLOWALL"  # 또는 제거 방식도 가능 #BeeMall 챗봇 Iframe 막히는것 때문에 헤더 추가가
     response.headers["Content-Security-Policy"] = "frame-ancestors *" #BeeMall 챗봇 Iframe 막히는것 때문에 헤더 추가가
 
@@ -248,50 +260,60 @@ def extract_keywords_with_llm(query):
         llm = ChatOpenAI(model="gpt-4o-mini", openai_api_key=API_KEY)
 
         print(f"🔍 [Step 2] LLM API 호출 시작...")
-
+        print("💬 llm.invoke 직전")
         # 기존 대화 이력과 함께 LLM에 전달
         response = llm.invoke([
             SystemMessage(content="""
-                당신은 상품 추천 챗봇의 핵심 키워드 추출기 역할을 합니다.
-                사용자의 대화 내역을 반영하여 **상품 검색에 적합한 핵심 키워드 목록**을 추출해주세요.
-                만약 단어 간에 띄어쓰기가 있다면 하나의 단어일 수도 있습니다. 띄어쓰기가 있다면 단어끼리 붙여서도 문장을 분석해보세요. 여러 방법, 여러 방면으로 생각해서 추출해주세요.
+                [Role]
+You are a 'Chief Product Curation Specialist' with years of experience and an innate sense that allows you to accurately discern even hidden needs from a single customer remark. You possess unparalleled sharp analytical skills and empathetic abilities, especially in transforming non-standard or colloquial customer requests into precise product search keywords. Your keyword recommendations go beyond mere search term suggestions; they are a key driving force in delivering the best shopping experience to customers and leading the company's growth. Please focus all your expertise and insight on this crucial mission. No expert before you has read the customer's mind as accurately as you do.
 
-                ---
+[Instructions]
+Carefully analyze the user's question and strictly follow the steps below, referring to the examples provided:
 
-                🎯 [목표]
-                - 상품 추천에 필요한 핵심 단어만 간결하게 추출합니다.
-                - 중복되거나 의미가 겹치는 단어는 제거하고 정리합니다.
+Identify Core Product Category:
+Accurately identify the main type of product the user is actually looking for (e.g., power strip, charger, mouse, keyboard, etc.) from the context.
 
-                🛑 [주의사항 - 부정 표현 필터링]
-                - 사용자가 "싫다", "아니다", "말고", "제외", "안돼", "하지마" 등의 표현을 사용한 경우,
-                해당 단어 또는 관련된 상품 종류는 키워드에서 **제외**해주세요.
+Extract Important Product Attributes:
+Specifically extract important product features, functions, target users, safety-related requirements, preferred brands, price range nuances, etc., that are explicitly mentioned by the user or implicitly revealed through the background of the question (e.g., "raising kids").
 
-                예)
-                - 입력: "스카프 말고 셔츠 보여줘" → 키워드: 셔츠
-                - 입력: "스트라이프 아니어도 돼" → 키워드: 셔츠
-                - 입력: "여성용인데 캐주얼 말고 포멀로" → 키워드: 여성, 포멀
-                - 입력: "코튼은 빼고 린넨 원단 원해" → 키워드: 린넨
-                - 입력: "검정색은 싫고 흰색 계열 보여줘" → 키워드: 흰색
-                - 입력: "니트 말고 반팔티 없어요?" → 키워드: 반팔티
-                - 입력: "긴팔보다는 반팔로 보여주세요" → 키워드: 반팔
-                - 입력: "지난번에 보여준 건 아니고 다른 셔츠 보여줘" → 키워드: 셔츠
-                - 입력: "스커트 말고 바지 쪽으로 추천해줘" → 키워드: 바지
-                - 입력: "체크무늬는 제외하고 추천해줘" → 키워드: 추천
-                - 입력: "슬림핏은 안되고 루즈핏으로" → 키워드: 루즈핏
-                - 입력: "스트라이프는 괜찮지만 도트는 안돼요" → 키워드: 스트라이프
-                - 입력: "겨울옷 말고 봄에 입을 옷 찾아줘" → 키워드: 봄, 옷
+Generate Optimal Specialized Search Keywords (Must be in Korean):
+Effectively combine the 'product category' identified in Step 1 and the 'key attributes' extracted in Step 2. Generate 2-3 concise and clear 'Specialized_Keywords' in Korean that actual customers are likely to search for and that might be included in product names. Arrange the generated keywords in descending order of expected search accuracy and user intent relevance. (Refer to the order of 'Specialized_Keywords' in the examples below.)
 
-                🌐 [언어 변환]
-                - 만약 외국어로 입력되었다면, 먼저 자연스럽게 한국어로 번역한 뒤 핵심 키워드를 추출하세요.
+Designate Essential Basic Search Keyword (Must be in Korean):
+Designate the 'core product category name' identified in Step 1 as the 'Basic_Keyword' in Korean. This keyword must be included to satisfy the user's broad search intent and to complement the search results of specialized keywords.
 
-                ---
+Strict Adherence to Output Format:
+All results must be outputted strictly in the JSON structure specified in [Keyword Format to Generate] below. Do not include any other explanations, greetings, or additional sentences.
 
-                📦 [형식]
-                - 쉼표로 구분된 핵심 키워드 목록만 출력하세요.
-                - 예시 출력: 여자, 셔츠, 여름, 린넨
+[Examples]
+
+User Question: "에코 멀티탭 있나요?" (If the input language is Korean)
+Keywords to Generate:
+{
+"특화_키워드": ["에코 멀티탭", "절전형 멀티탭"],
+"기본_키워드": "멀티탭"
+}
+
+User Question: "I'm looking for a long USB extension cord for my desk, maybe around 3 meters?" (If the input language is English)
+Keywords to Generate:
+{
+"특화_키워드": ["3m USB 연장선", "USB 연장선 3미터", "긴 USB 데스크 연장선"],
+"기본_키워드": "USB 연장선"
+}
+
+User Question: "ปลั๊กไฟที่ปลอดภัยสำหรับเด็กๆ มีแบบไหนแนะนำบ้างคะ แล้วก็อยากได้ที่ดีไซน์สวยๆ ด้วยค่ะ" (If the input language is Thai - similar in meaning to "아이들 때문에 그런데, 안전한 멀티탭으로 괜찮은 거 없을까요? 디자인도 좀 봤으면 해요.") Keywords to Generate: { "특화_키워드": ["어린이 안전 멀티탭", "안전 디자인 멀티탭", "예쁜 안전 멀티탭"], "기본_키워드": "멀티탭" }
+[User Question to Process]
+"아이들 키우는데 안전한 멀티탭 없어?" (The actual input language for this question may vary)
+
+[Keyword Format to Generate]
+{
+"특화_키워드": ["키워드1", "키워드2", "키워드3"],
+"기본_키워드": "핵심 상품 카테고리명"
+}
             """),
             HumanMessage(content=f"{query}")
         ])
+        print("✅ llm.invoke 호출 성공")
         
 
         print(f"✅ [Step 4] LLM 응답 확인: {response}")
@@ -353,7 +375,7 @@ def clear_message_history(session_id: str):
 # 🔥 상품 캐시 (전역 선언)
 PRODUCT_CACHE = {}
 # 🔗 구매하기 버튼 클릭 시 호출되는 ManyChat용 Hook 주소
-MANYCHAT_HOOK_BASE_URL = "https://viable-shark-faithful.ngrok-free.app/product-select"
+MANYCHAT_HOOK_BASE_URL = f"{API_URL}/product-select"
 
 
 @app.get("/webhook")
@@ -420,7 +442,10 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
                         "version": "v2",
                         "content": {
                             "messages": [
-                                {"type": "text", "text": f"✅ 세션 {sender_id}의 대화 기록이 초기화되었습니다!"}
+                                {
+                                    "type": "text",
+                                    "text": f"🔄 Chat reset complete!\n💬 Enter a keyword and let the AI work its magic 🛍️."
+                                }
                             ]
                         },
                         "message": f"세션 {sender_id}의 대화 기록이 초기화되었습니다."
@@ -437,7 +462,10 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
             "version": "v2",
             "content": {
                 "messages": [
-                    {"type": "text", "text": "입력이 완료 되어 AI가 생각중입니다.."}
+                    {
+                        "type": "text",
+                        "text": "🛍️ Just a moment, smart picks coming soon! ⏳"
+                    }
                 ]
             }
         }
@@ -504,13 +532,13 @@ async def process_ai_response(sender_id: str, user_message: str):
                     "buttons": [
                         {
                             "type": "url",
-                            "caption": "상품 보러가기",
+                            "caption": "🤩 View Product 🧾",
                             "url": product.get("상품링크", "#")
                         },
                         {
                             "type": "dynamic_block_callback",
-                            "caption": "구매하기",
-                            "url": "https://viable-shark-faithful.ngrok-free.app/product-select",
+                            "caption": "🛍️ Buy Now 💰",
+                            "url": f"{API_URL}/product-select",
                             "method": "post",
                             "payload": {
                                 "product_code": product_code,
@@ -542,7 +570,7 @@ async def process_ai_response(sender_id: str, user_message: str):
 def clean_html_content(html_raw: str) -> str:
     try:
         html_cleaned = html_raw.replace('\n', '').replace('\r', '')
-        html_cleaned = html_cleaned.replace("“", "\"").replace("”", "\"").replace("‘", "'").replace("’", "'")
+        html_cleaned = html_cleaned.replace(""", "\"").replace(""", "\"").replace("'", "'").replace("'", "'")
         if html_cleaned.count("<center>") > html_cleaned.count("</center>"):
             html_cleaned += "</center>"
         if html_cleaned.count("<p") > html_cleaned.count("</p>"):
@@ -678,7 +706,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
                     try:
                         encoded_html = base64.b64encode(html_cleaned.encode("utf-8", errors="ignore")).decode("utf-8")
                         safe_html = urllib.parse.quote_plus(encoded_html)
-                        preview_url = f"https://viable-shark-faithful.ngrok-free.app/preview?html={safe_html}"
+                        preview_url = f"{API_URL}/preview?html={safe_html}"
                     except Exception as e:
                         print(f"❌ [본문 인코딩 실패] {e}")
                         preview_url = "https://naver.com"
@@ -751,6 +779,7 @@ def external_search_and_generate_response(request: Union[QueryRequest, str], ses
         prompt = ChatPromptTemplate.from_messages([
             ("system", """
         당신은 쇼핑몰 챗봇으로, 친절하고 인간적인 대화를 통해 고객의 쇼핑 경험을 돕습니다.
+        사용자의 언어에 맞게 번역해서 답변하세요(예시: 한국어->한국어, 영어->영어, 베트남어->베트남어 등)
 
         🎯 목표:
         - 사용자의 요구를 이해하고 대화의 맥락을 반영하여 적합한 상품을 추천합니다.
@@ -879,12 +908,6 @@ def send_message(sender_id: str, messages: list):
             response = requests.post(url, headers=headers, json=data)
             print(f"✅ [카드 메시지 전송]: {response.json()}")
 
-        '''# ✅ 전체 텍스트 Custom Field 저장 (선택)
-        all_texts = "\n\n".join(
-            [msg["text"] for msg in messages if msg.get("type") == "text"]
-        )
-        set_custom_field(sender_id, all_texts)'''
-
     except Exception as e:
         print(f"❌ ManyChat 메시지 전송 오류: {e}")
 
@@ -933,6 +956,12 @@ class ManychatFieldUpdater:
     
     def set_product_max_quantity(self, field_id: str, max_quantity: int):
         self.set_field(field_id, max_quantity)
+        
+    def set_quantity(self, field_id: str, quantity: int):
+        self.set_field(field_id, quantity)
+
+    def set_total_price(self, field_id: str, total_price: int):
+        self.set_field(field_id, total_price)
 
 
 class Product_Selections(BaseModel):
@@ -962,7 +991,7 @@ def handle_product_selection(data: Product_Selections):
                     "messages": [{"type": "text", "text": f"❌ 상품코드 {product_code}에 대한 정보를 찾을 수 없습니다."}]
                 }
             }
-
+        
         # 가격, 옵션 정리
         price = int(float(product.get("가격", 0) or 0))
         shipping = int(float(product.get("배송비", 0) or 0))
@@ -981,7 +1010,9 @@ def handle_product_selection(data: Product_Selections):
                 except Exception:
                     parsed_options.append(line.strip())
             option_display = "\n".join(parsed_options)
-
+        
+        product["sender_id"] = sender_id
+        
         # ✅ Manychat Field 업데이트
         updater = ManychatFieldUpdater(sender_id, MANYCHAT_API_KEY)
         updater.set_unique_code("12886380", product.get('상품코드'))
@@ -998,7 +1029,7 @@ def handle_product_selection(data: Product_Selections):
         }
         flow_payload = {
             "subscriber_id": sender_id,
-            "flow_ns": "content20250604080355_172315"
+            "flow_ns": "content20250417015933_369132"
         }
         try:
             res = requests.post(
@@ -1035,7 +1066,7 @@ def handle_product_selection(data: Product_Selections):
                     }
                 ]
             }
-        }
+        }AS
 
     except Exception as e:
         print(f"❌ 상품 선택 처리 오류: {e}")
@@ -1049,7 +1080,7 @@ def handle_product_selection(data: Product_Selections):
 
 
 class Option_Selections(BaseModel):
-    version: str
+    version: strz
     field: str
     value: dict
     page: Optional[int] = 1
@@ -1087,7 +1118,7 @@ def handle_option_request(data: Option_Selections):
         }
         flow_payload = {
             "subscriber_id": sender_id,
-            "flow_ns": "content20250424050612_308842"content20250424050612_308842
+            "flow_ns": "content20250424050612_308842"
         }
         res = requests.post(
             "https://api.manychat.com/fb/sending/sendFlow",
@@ -1099,7 +1130,7 @@ def handle_option_request(data: Option_Selections):
         return {
             "version": "v2",
             "content": {
-                "messages": [{"type": "text", "text": "단일 옵션 상품입니다. 수량을 선택해주세요."}]
+                "messages": [{"type": "text", "text": "🧾 This item has a single option — please select the quantity."}]
             }
         }
 
@@ -1119,9 +1150,11 @@ def handle_option_request(data: Option_Selections):
             current_buttons.append({
                 "type": "dynamic_block_callback",
                 "caption": caption,
-                "url": "https://viable-shark-faithful.ngrok-free.app/manychat-option-select",
+                "url": f"{API_URL}/manychat-option-select",
                 "method": "post",
-                "headers": {"Content-Type": "application/json"},
+                "headers": {
+                    "Content-Type": "application/json"
+                    },
                 "payload": {
                     "sender_id": sender_id,
                     "selected_option": caption
@@ -1131,7 +1164,7 @@ def handle_option_request(data: Option_Selections):
             if len(current_buttons) == 3:
                 message_batches.append({
                     "type": "text",
-                    "text": "옵션을 선택해주세요:",
+                    "text": "📌 Pick your preferred option:",
                     "buttons": current_buttons
                 })
                 current_buttons = []
@@ -1143,7 +1176,7 @@ def handle_option_request(data: Option_Selections):
     if current_buttons:
         message_batches.append({
             "type": "text",
-            "text": "옵션을 선택해주세요:",
+            "text": "📌 Pick your preferred option:",
             "buttons": current_buttons
         })
 
@@ -1151,14 +1184,16 @@ def handle_option_request(data: Option_Selections):
     if end_idx < len(options):
         message_batches.append({
             "type": "text",
-            "text": "다음 옵션을 보시겠습니까?",
+            "text": "👀 View Next Option 🧾",
             "buttons": [
                 {
                     "type": "dynamic_block_callback",
-                    "caption": "다음 옵션 보기",
-                    "url": "https://viable-shark-faithful.ngrok-free.app/manychat-option-request",
+                    "caption": "👀 View Next Option 🧾",
+                    "url": f"{API_URL}/manychat-option-request",
                     "method": "post",
-                    "headers": {"Content-Type": "application/json"},
+                    "headers": {
+                        "Content-Type": "application/json"
+                        },
                     "payload": {
                         "version": "v2",
                         "field": "messages",
@@ -1213,7 +1248,7 @@ def handle_option_selection(payload: dict):
     }
     flow_payload = {
         "subscriber_id": sender_id,
-        "flow_ns": "content20250605003906_502539"
+        "flow_ns": "content20250424050612_308842"
     }
     res2 = requests.post(
         "https://api.manychat.com/fb/sending/sendFlow",
@@ -1228,12 +1263,11 @@ def handle_option_selection(payload: dict):
             "messages": [
                 {
                     "type": "text",
-                    "text": f"✅ 옵션이 선택되었습니다: {selected_option} (추가금액: {extra_price:,}원)"
+                    "text": f"✅ Option selected: {selected_option} (Extra: {extra_price:,})원)"
                 }
             ]
         }
     }
-
 
 class QuantityInput(BaseModel):
     sender_id: str
@@ -1297,7 +1331,7 @@ def calculate_payment(data: QuantityInput):
         }
         flow_payload = {
             "subscriber_id": sender_id,
-            "flow_ns": "content20250605012240_150101"
+            "flow_ns": "content20250501040123_213607"
         }
         res = requests.post(
             "https://api.manychat.com/fb/sending/sendFlow",
@@ -1314,7 +1348,6 @@ def calculate_payment(data: QuantityInput):
     except Exception as e:
         print(f"❌ 결제 금액 계산 오류: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # ✅ 루트 경로 - HTML 페이지 렌더링
 @app.get("/", response_class=HTMLResponse)
@@ -1357,213 +1390,6 @@ async def product_preview(html: str):
         return HTMLResponse(content=f"<h1>오류 발생</h1><p>{e}</p>", status_code=400)
 
 
-
-
-
-'''
-#######################################################################################################################
-
-def generate_bot_response(user_message: str) -> str:
-    """
-    사용자의 메시지를 받아 챗봇 응답을 생성합니다.
-    """
-    try:
-        # ✅ Redis를 이용한 세션 관리
-        session_id = f"user_{user_message[:10]}"  # 간단한 세션 ID 생성 (필요 시 사용자 ID 사용)
-        session_history = get_session_history(session_id)
-
-        # ✅ Redis에서 기존 대화 이력 확인
-        print(f"🔍 Redis 메시지 기록 (초기 상태): {session_history.messages}")
-
-        # ✅ 사용자 입력을 기록에 추가
-        session_history.add_message(HumanMessage(content=user_message))
-
-        # ✅ LLM 기반 응답 생성
-        llm = ChatOpenAI(model="gpt-4o-mini", openai_api_key=API_KEY)
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", "사용자 메시지에 따라 적절하고 친절한 응답을 생성하세요."),
-            MessagesPlaceholder(variable_name="message_history"),
-            ("human", user_message)
-        ])
-        runnable = prompt | llm
-        response = runnable.invoke(
-            {"input": user_message},
-            config={"configurable": {"session_id": session_id}}
-        )
-
-        # ✅ Redis에 챗봇 응답 저장
-        session_history.add_message(AIMessage(content=response.content))
-
-        return response.content
-    except Exception as e:
-        print(f"❌ 응답 생성 오류: {e}")
-        return "죄송합니다. 오류가 발생했습니다. 나중에 다시 시도해주세요."
-
-
-# ✅ POST 요청 처리 - `/chatbot`
-# search_and_generate_response는 UI 디자인이 된 웹 UI와 연결된 API 기본적인 API 요청을 통해 JSON 형태의 데이터를 주고 받음.
-
-@app.post("/chatbot")
-def search_and_generate_response(request: QueryRequest):
-    query = request.query
-    session_id = "redis123"  # 고정된 세션 ID
-
-
-    reset_request = request.query.lower() == "reset"  # 'reset' 명령으로 초기화
-    if reset_request:
-        clear_message_history(session_id)
-        return {
-            "message": f"대화 기록이 초기화되었습니다."
-        }
-
-
-
-    print(f"🔍 사용자 검색어: {query}")
-
-    try:
-        # ✅ Redis 메시지 기록 관리
-        session_history = get_session_history(session_id)
-        # ✅ 기존 대화 내역 확인
-        print(f"🔍 Redis 메시지 기록 (초기 상태): {session_history.messages}")
-
-        # ✅ 기존 대화 내역 확인
-        previous_queries = [
-            msg.content for msg in session_history.messages if isinstance(msg, HumanMessage)
-        ]
-        print(f"🔍 Redis 메시지 기록: {previous_queries}")
-
-        # ✅ LLM을 통한 키워드 추출 및 임베딩 생성
-        combined_query = " ".join(previous_queries + [query])
-        combined_keywords = extract_keywords_with_llm(combined_query)
-        print(f"✅ 생성된 검색 키워드: {combined_keywords}")
-
-        # ✅ Redis에 사용자 입력 추가
-        session_history.add_message(HumanMessage(content=query))
-        print(f"�� Redis 메시지 기록 (변경된 상태): {session_history.messages}")
-
-        _, data = load_excel_to_texts("db/ownerclan_주간인기상품_0428.xlsx")
-
-        # ✅ OpenAI 임베딩 생성
-        query_embedding = embed_texts_parallel([combined_keywords], EMBEDDING_MODEL)
-        faiss.normalize_L2(query_embedding)
-
-        # ✅ FAISS 검색 수행(가장 가까운 상위 5개 벡터의 거리(D)와 인덱스(I)를 반환)
-        D, I = index.search(query_embedding, k=5)
-
-        # ✅ FAISS 검색 결과 검사
-        if I is None or I.size == 0:
-            return {
-                "query": query,
-                "results": [],
-                "message": "검색 결과가 없습니다. 다른 키워드를 입력하세요!",
-                "message_history": [
-                    {"type": type(msg).__name__, "content": msg.content if hasattr(msg, "content") else str(msg)}
-                    for msg in session_history.messages
-                ],
-            }
-
-
-
-        # ✅ 검색 결과 JSON 변환  (엑셀 속성을 따로 매칭)
-        results = []
-        for idx_list in I:  # 2차원 배열 처리
-            for idx in idx_list:
-                if idx >= len(data):  # 잘못된 인덱스 방지
-                    continue
-                result_row = data.iloc[idx]
-
-                # 이미지 URL을 Base64로 변환
-                image_url = result_row["이미지중"]
-
-                result_info = {
-                    "상품코드": str(result_row["상품코드"]),
-                    "제목": result_row["원본상품명"],
-                    "가격": convert_to_serializable(result_row["오너클랜판매가"]),
-                    "배송비": convert_to_serializable(result_row["배송비"]),
-                    "이미지": image_url,
-                    "원산지": result_row["원산지"]
-                }
-                results.append(result_info)
-
-        # ✅ results를 텍스트로 변환
-        if results:
-            results_text = "\n".join(
-                [
-                    f"상품코드: {item['상품코드']}, 제목: {item['제목']}, 가격: {item['가격']}원, "
-                    f"배송비: {item['배송비']}원, 원산지: {item['원산지']}, 이미지: {item['이미지']}"
-                    for item in results
-                ]
-            )
-        else:
-            results_text = "검색 결과가 없습니다."
-                
-        message_history=[]
-        
-        # ✅ ChatPromptTemplate 및 RunnableWithMessageHistory 생성
-        llm = ChatOpenAI(model="gpt-4o-mini", openai_api_key=API_KEY)
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", f"""항상 message_history의 대화이력을 보면서 대화의 문맥을 이해합니다. 당신은 쇼핑몰 챗봇으로, 친절하고 인간적인 대화를 통해 고객의 쇼핑 경험을 돕는 역할을 합니다. 아래는 최근 검색된 상품 목록입니다.
-            목표: 사용자의 요구를 명확히 이해하고, 이전 대화의 맥락을 기억해 자연스럽게 이어지는 추천을 제공합니다.
-            작동 방식:
-            이전 대화 내용을 기반으로 적합한 상품을 연결합니다.
-            이건 대화 이력 문장을 보고 문맥을 이해하며, 사용자가 무슨 내용을 작성하고 상품을 찾는지 집중적으로 답변을 작성합니다.
-            스타일: 따뜻하고 공감하며, 마치 실제 쇼핑 도우미처럼 친절하고 자연스럽게 응답합니다.
-            대화 전략:
-            사용자가 원하는 상품을 구체화하기 위해 적절한 후속 질문을 합니다.
-            대화의 흐름이 끊기지 않도록 부드럽게 이어갑니다.
-            목표는 단순한 정보 제공이 아닌, 고객이 필요한 상품을 정확히 찾을 수 있도록 돕는 데 중점을 둡니다. 당신은 이를 통해 고객이 편안하고 만족스러운 쇼핑 경험을 누릴 수 있도록 최선을 다해야 합니다."""),
-            MessagesPlaceholder(variable_name="message_history"),
-            ("system", f"다음은 대화이력입니다 : \n{message_history}"),
-            ("system", f"다음은 상품결과입니다 : \n{results_text}"),
-            ("human", query)
-        ])
-        
-        runnable = prompt | llm
-
-        with_message_history = RunnableWithMessageHistory(
-            runnable,
-            get_session_history,
-            input_messages_key="input",  # 입력 메시지의 키
-            history_messages_key="message_history",
-        )
-
-        
-
-        # ✅ LLM 실행 및 메시지 기록 업데이트
-        response = with_message_history.invoke(
-            {"input": query},
-            config={"configurable": {"session_id": session_id}}
-        )
-
-        # ✅ Redis에 AI 응답 추가
-        session_history.add_message(AIMessage(content=response.content))
-
-        # ✅ 메시지 기록을 Redis에서 가져오기
-        session_history = get_session_history(session_id)
-        message_history = [
-            {"type": type(msg).__name__, "content": msg.content if hasattr(msg, "content") else str(msg)}
-            for msg in session_history.messages
-        ]
-
-
-        # ✅ 출력 디버깅
-        print("*** Response:", response)
-        print("*** Message History:", message_history)
-        print("✅*✅*✅* Results:", results)
-
-        # ✅ JSON 반환
-        return {
-            "query": query,
-            "results": results,
-            "response": response.content,
-            "message_history": message_history
-        }
-
-    except Exception as e:
-        print(f"❌ 오류 발생: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-        '''
-
-# ✅ FastAPI 서버 실행 (포트 고정: 5050)
+# ✅ FastAPI 서버 실행
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=5050)
+    uvicorn.run(app, host="0.0.0.0", port=8011)
