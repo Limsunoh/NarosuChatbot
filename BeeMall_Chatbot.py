@@ -7,11 +7,10 @@ import re
 import time
 import urllib
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Union
+from typing import Optional, Union, List
 from urllib.parse import quote
 import math
 
-import faiss
 import numpy as np
 import pandas as pd
 import redis
@@ -61,8 +60,34 @@ print(f"🔍 로드된 PAGE_ACCESS_TOKEN: {PAGE_ACCESS_TOKEN}")
 print(f"🔍 로드된 API_KEY: {API_KEY}")
 print(f"🔍 로드된 API_URL: {API_URL}")
 
-# ✅ FAISS 인덱스 파일 경로 설정
-faiss_file_path = f"04_28_faiss_3s.faiss"
+# # ✅ FAISS 인덱스 파일 경로 설정
+# faiss_file_path = f"04_28_faiss_3s.faiss"
+
+# ─── Milvus import & 연결 ───────────────────────────────────────────────
+# 올바른 공인 IP와 포트
+connections.connect(
+    alias="default",
+    host="114.110.135.96",
+    port="19530"
+)
+print("✅ Milvus에 연결되었습니다.")
+
+# 컬렉션 이름
+collection_name = "ownerclan_weekly_0428"
+
+# 컬렉션 객체 생성 (조회 용도)
+collection = Collection(name=collection_name)
+
+# OpenAI Embedding 모델 (쿼리용)
+emb_model = OpenAIEmbeddings(
+    model="text-embedding-3-small",
+    openai_api_key=os.getenv("OPENAI_API_KEY")
+
+# 💡 저장된 벡터 수 확인
+)
+print(f"\n📊 저장된 엔트리 수: {collection.num_entities}")
+# ────────────────────────────────────────────────────────────────────────
+
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 
@@ -134,226 +159,85 @@ def convert_to_serializable(obj):
         return obj.item()
     return obj
 
-# ✅ 엑셀 데이터 로드 및 변환 (본문상세설명 컬럼 제외하고 임베딩용 텍스트 생성)
-def load_excel_to_texts(file_path):
+
+def minimal_clean_with_llm(latest_input: str, previous_inputs: List[str]) -> str:
+    """
+    최신 입력과 Redis에서 가져온 과거 입력을 함께 LLM에게 전달하여,
+    최소한의 정제 + 충돌 문맥 제거를 수행한 한 문장 반환
+    """
     try:
-        data = pd.read_excel(file_path)
-        data.columns = data.columns.str.strip()
-
-        # 임베딩용 데이터프레임에서 '본문상세설명' 제외
-        if '본문상세설명' in data.columns:
-            embedding_df = data.drop(columns=['본문상세설명'])
-        else:
-            embedding_df = data
-
-        texts = [" | ".join([f"{col}: {row[col]}" for col in embedding_df.columns]) for _, row in embedding_df.iterrows()]
-        return texts, data  # 원본 데이터(data)는 본문상세설명 포함
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"엑셀 파일 로드 오류: {str(e)}")
-
-# ✅ FAISS 인덱스 저장
-def save_faiss_index(index, file_path):
-    try:
-        faiss.write_index(index, file_path)
-    except Exception as e:
-        print(f"❌ FAISS 인덱스 저장 오류: {e}")
-
-# ✅ FAISS 인덱스 로드
-def load_faiss_index(file_path):
-    try:
-        return faiss.read_index(file_path)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"FAISS 인덱스 로딩 오류: {str(e)}")
-
-# ✅ 문서 임베딩 함수 (병렬 처리)
-def embed_texts_parallel(texts, embedding_model=EMBEDDING_MODEL, max_workers=8):
-    try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            임베딩 = OpenAIEmbeddings(model=embedding_model, openai_api_key=API_KEY)
-            embeddings = list(executor.map(임베딩.embed_query, texts))
-        return np.array(embeddings, dtype=np.float32)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"임베딩 생성 오류: {str(e)}")
-
-# ✅ FAISS 인덱스 생성 및 저장 함수 (병렬 처리 적용)
-def create_and_save_faiss_index(file_path):
-    try:
-        start_time = time.time()
-        
-        # 엑셀 파일 로드 및 변환
-        texts, _ = load_excel_to_texts(file_path)
-        print(f"📊 엑셀 파일 로드 및 변환 완료! ({len(texts)}개 텍스트)")
-
-        # 임베딩 생성 (병렬 처리 적용)
-        embeddings = embed_texts_parallel(texts, EMBEDDING_MODEL)
-        print(f"📊 임베딩 생성 완료!")
-        
-        # ✅ 예시 텍스트 1줄 출력해서 본문상세설명 포함 여부 확인
-        print("🔎 임베딩 대상 텍스트 예시 1줄:")
-        print(texts[0])  # 본문상세설명 포함 여부 확인용
-        
-        # 임베딩 벡터의 개수와 각 벡터의 차원 출력
-        print(f"🔍🔍 임베딩 벡터 개수: {len(embeddings)}, 임베딩 차원: {embeddings.shape[1]}")
-        print(f"🔍🔍 임베딩 벡터 개수: {embeddings.shape[0]}")
-
-        # FAISS 인덱스 설정
-        faiss.normalize_L2(embeddings)
-        d = embeddings.shape[1]
-        nlist = min(200, len(texts) // 100)  # 클러스터 개수 설정 (데이터 개수에 비례)
-        quantizer = faiss.IndexFlatL2(d)
-        index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
-
-        # 인덱스 학습 및 추가
-        index.train(embeddings)
-        index.add(embeddings)
-
-        # 인덱스 저장
-        save_faiss_index(index, faiss_file_path)
-
-        end_time = time.time()
-        print(f"✅ FAISS 인덱스 생성 및 저장 완료! (걸린 시간: {end_time - start_time:.2f} 초)")
-    
-    except Exception as e:
-        print(f"❌ FAISS 인덱스 생성 및 저장 오류: {e}")
-    
-
-# ✅ 인덱스 로드 또는 생성하기
-def initialize_faiss_index():
-    if not os.path.exists(faiss_file_path):
-        # 현재 디렉토리의 'db' 폴더 안에서 엑셀 파일을 검색
-        file_path = os.path.join(os.getcwd(), "db", "ownerclan_주간인기상품_0428.xlsx")
-        
-        # 🔍 엑셀 데이터 로드 확인
-        texts, data = load_excel_to_texts(file_path)
-        print(data.head())  # 데이터의 첫 5개 행 출력 (엑셀 데이터 확인용)
-        print(texts[0])  # 텍스트의 첫 번째 항목 출력 
-        
-        create_and_save_faiss_index(file_path)
-    index = load_faiss_index(faiss_file_path)
-    return index
-
-# ✅ 인덱스 초기화 실행
-index = initialize_faiss_index()
-
-# ✅ LLM을 이용한 키워드 추출 및 대화 이력 반영
-def extract_keywords_with_llm(query):
-    try:
-        
-        print(f"🔍 [extract_keywords_with_llm] 입력값: {query}")
-
-        # ✅ Step 1: API 키 확인
         if "OPENAI_API_KEY" not in os.environ:
-            raise ValueError("❌ [ERROR] {API_KEY} 환경 변수 OPENAI_API_KEY가 설정되지 않았습니다.")
+            raise ValueError("❌ [ERROR] OPENAI_API_KEY가 설정되지 않았습니다.")
         API_KEY = os.environ["OPENAI_API_KEY"]
-        
-        if not API_KEY or not isinstance(API_KEY, str):
-            raise ValueError("❌ [ERROR] OpenAI API_KEY가 None이거나 잘못되었습니다!")
-
-        print(f"🔍 [DEBUG] OpenAI API Key 확인 완료")
-
-        # ✅ [Step 1] query 값 검증
-        if not isinstance(query, str) or not query.strip():
-            raise ValueError(f"❌ [ERROR] query 값이 잘못되었습니다: {query} (타입: {type(query)})")
-
-        redis_start = time.time()
 
         llm = ChatOpenAI(model="gpt-4o-mini", openai_api_key=API_KEY)
 
-        print(f"🔍 [Step 2] LLM API 호출 시작...")
-        print("💬 llm.invoke 직전")
-        # 기존 대화 이력과 함께 LLM에 전달
+        context_message = "\n".join(previous_inputs)
+
+        system_prompt = """
+            당신은 사용자의 과거 대화 맥락과 최신 입력을 기반으로 의미 있는 문장을 재구성하는 전문가입니다.\n
+            다음 기준을 철저히 따르세요:\n
+            1. 이전 입력 중 **최신 입력과 의미가 충돌하는 문장**은 완전히 제거합니다.\n
+            2. **충돌이 없는 이전 입력은 유지**하며, **최신 입력을 반영**해 전체 흐름을 자연스럽게 이어가세요.\n
+            3. 문장의 단어 순서나 표현은 원문을 최대한 유지합니다.\n
+            4. 오타, 띄어쓰기, 맞춤법만 교정하세요.\n
+            5. 어떤 언어로 입력되었든 **결과는 한국어 한 문장**으로 출력하세요.\n
+            6. 절대로 결과에 설명을 추가하지 마세요. **한 문장만 출력**합니다.\n
+            \n
+            ---\n
+            \n
+            # 예시 1:\n
+            이전 입력:\n
+            - 강아지 옷 찿아줘\n
+            - 밝은색 으로다시찾아\n
+            - 겨울 용이면 더조아\n
+            \n
+            최신 입력:\n
+            - 여름용으로 바꿔줘\n
+            \n
+            → 결과: "강아지 옷 여름용 밝은 색으로 찾아줘"\n
+            \n
+            ---\n
+            \n
+            # 예시 2:\n
+            이전 입력:\n
+            - 아이폰보여줘\n
+            - 프로 모델 이면 좋겠 어\n
+            - 실버 색상으로 봐줘\n
+            \n
+            최신 입력:\n
+            - 갤럭시로 바꿔줘\n
+            \n
+            → 결과: "갤럭시 실버 색상으로 보여줘"\n
+            \n
+            ---\n
+            \n
+            # 예시 3:\n
+            이전 입력:\n
+            - 운동화250mm사이즈찿아줘\n
+            - 흰 색 계열이 좋아\n
+            - 쿠션감있는거 위주로\n
+            \n
+            최신 입력:\n
+            - 260mm로 바꿔줘\n
+            \n
+            → 결과: "운동화 260mm 흰색 쿠션감 있는 걸로 찾아줘"\n
+            """
+
         response = llm.invoke([
-            SystemMessage(content="""
-                [Role]
-You are a 'Chief Product Curation Specialist' with years of experience and an innate sense that allows you to accurately discern even hidden needs from a single customer remark. You possess unparalleled sharp analytical skills and empathetic abilities, especially in transforming non-standard or colloquial customer requests into precise product search keywords. Your keyword recommendations go beyond mere search term suggestions; they are a key driving force in delivering the best shopping experience to customers and leading the company's growth. Please focus all your expertise and insight on this crucial mission. No expert before you has read the customer's mind as accurately as you do.
-
-[Instructions]
-Carefully analyze the user's question and strictly follow the steps below, referring to the examples provided:
-
-Identify Core Product Category:
-Accurately identify the main type of product the user is actually looking for (e.g., power strip, charger, mouse, keyboard, etc.) from the context.
-
-Extract Important Product Attributes:
-Specifically extract important product features, functions, target users, safety-related requirements, preferred brands, price range nuances, etc., that are explicitly mentioned by the user or implicitly revealed through the background of the question (e.g., "raising kids").
-
-Generate Optimal Specialized Search Keywords (Must be in Korean):
-Effectively combine the 'product category' identified in Step 1 and the 'key attributes' extracted in Step 2. Generate 2-3 concise and clear 'Specialized_Keywords' in Korean that actual customers are likely to search for and that might be included in product names. Arrange the generated keywords in descending order of expected search accuracy and user intent relevance. (Refer to the order of 'Specialized_Keywords' in the examples below.)
-
-Designate Essential Basic Search Keyword (Must be in Korean):
-Designate the 'core product category name' identified in Step 1 as the 'Basic_Keyword' in Korean. This keyword must be included to satisfy the user's broad search intent and to complement the search results of specialized keywords.
-
-Strict Adherence to Output Format:
-All results must be outputted strictly in the JSON structure specified in [Keyword Format to Generate] below. Do not include any other explanations, greetings, or additional sentences.
-
-[Examples]
-
-User Question: "에코 멀티탭 있나요?" (If the input language is Korean)
-Keywords to Generate:
-{
-"특화_키워드": ["에코 멀티탭", "절전형 멀티탭"],
-"기본_키워드": "멀티탭"
-}
-
-User Question: "I'm looking for a long USB extension cord for my desk, maybe around 3 meters?" (If the input language is English)
-Keywords to Generate:
-{
-"특화_키워드": ["3m USB 연장선", "USB 연장선 3미터", "긴 USB 데스크 연장선"],
-"기본_키워드": "USB 연장선"
-}
-
-User Question: "ปลั๊กไฟที่ปลอดภัยสำหรับเด็กๆ มีแบบไหนแนะนำบ้างคะ แล้วก็อยากได้ที่ดีไซน์สวยๆ ด้วยค่ะ" (If the input language is Thai - similar in meaning to "아이들 때문에 그런데, 안전한 멀티탭으로 괜찮은 거 없을까요? 디자인도 좀 봤으면 해요.") Keywords to Generate: { "특화_키워드": ["어린이 안전 멀티탭", "안전 디자인 멀티탭", "예쁜 안전 멀티탭"], "기본_키워드": "멀티탭" }
-[User Question to Process]
-"아이들 키우는데 안전한 멀티탭 없어?" (The actual input language for this question may vary)
-
-[Keyword Format to Generate]
-{
-"특화_키워드": ["키워드1", "키워드2", "키워드3"],
-"기본_키워드": "핵심 상품 카테고리명"
-}
-            """),
-            HumanMessage(content=f"{query}")
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"이전 대화: {context_message}\n최신 입력: {latest_input}")
         ])
-        print("✅ llm.invoke 호출 성공")
-        
 
-        print(f"✅ [Step 4] LLM 응답 확인: {response}")
+        if not hasattr(response, "content") or not isinstance(response.content, str):
+            raise ValueError("❌ LLM 응답이 유효하지 않습니다.")
 
-        # ✅ [Step 5] 응답 값 검증
-        if response is None:
-            raise ValueError("❌ [ERROR] LLM 응답이 None입니다.")
+        return response.content.strip()
 
-        if not hasattr(response, "content"):
-            raise AttributeError(f"❌ [ERROR] 응답 객체에 `content` 속성이 없습니다: {response}")
-
-        if not isinstance(response.content, str) or not response.content.strip():
-            raise ValueError(f"❌ [ERROR] LLM 응답이 비어 있거나 잘못된 데이터입니다: {response.content}")
-
-        # 키워드 업데이트
-        # ✅ 응답에서 '핵심 키워드: ' 부분 제거하여 임베딩에 사용하도록 함
-        keywords_text = response.content.replace("추출된 핵심 키워드:" , "").strip()
-        
-        # ✅ 벡터 검색용으로는 핵심 키워드 부분을 제거한 텍스트 사용
-        keywords_for_embedding = [keyword.strip() for keyword in keywords_text.split(",")]
-        combined_keywords = ", ".join(keywords_for_embedding)
-        
-        # ✅ AI 응답에서는 원본 텍스트(response.content)도 함께 사용할 수 있게 저장
-        keywords = {
-            "original_text": response.content,  # AI 응답용 원본 텍스트
-            "processed_keywords": combined_keywords  # 벡터 검색용 키워드 텍스트
-        }
-        
-        redis_time = time.time() - redis_start
-        logger.info(f"📊 LLM을 이용한 키워드 추출 시간: {redis_time:.4f} 초")
-        
-        if not combined_keywords:
-            raise ValueError("❌ [ERROR] 키워드 추출 결과가 비어 있음.")
-
-        print(f"✅ [Step 7] 추출된 키워드: {combined_keywords}")
-
-        return combined_keywords
     except Exception as e:
-        print(f"❌ [ERROR] extract_keywords_with_llm 실행 중 오류 발생: {e}")
-        raise
+        print(f"❌ [ERROR] minimal_clean_with_llm 실패: {e}")
+        return latest_input  # 실패 시 최신 입력만 사용
+
 
 def get_session_history(session_id: str) -> BaseChatMessageHistory:
     
@@ -586,277 +470,183 @@ external_search_and_generate_response는 ManyChat 같은 외부 서비스와 연
 '''
 
 # ✅ 외부 검색 및 응답 생성 함수
-def external_search_and_generate_response(request: Union[QueryRequest, str], session_id: str = None) -> dict:  
-
-    # ✅ [Step 1] 요청 데이터 확인
-    query = request
-    print(f"🔍 사용자 검색어: {query}")
-
-    if not isinstance(query, str):
-        raise TypeError(f"❌ [ERROR] 잘못된 query 타입: {type(query)}")
-    
-
-    # ✅ [Step 2] Reset 요청 처리
-    if query.lower() == "reset":
-        if session_id:
-            clear_message_history(session_id)
-        return {"message": f"세션 {session_id}의 대화 기록이 초기화되었습니다."}
-
+def external_search_and_generate_response(request: Union[QueryRequest, str], session_id: str = None) -> dict:
     try:
-        # ✅ Step 3: Redis 기록 불러오기
-        redis_start = time.time()
-        session_history = get_session_history(session_id)
-        redis_time = time.time() - redis_start
-        print(f"📊 [Step 3] Redis 메시지 기록 관리 시간: {redis_time:.4f} 초")
+        # ✅ 입력 쿼리 추출 및 타입 확인
+        query = request if isinstance(request, str) else request.query
+        print(f"🔍 사용자 검색어: {query}")
 
-        # ✅ [Step 4~5] 최신 메시지 기록 다시 불러오기
+        if not isinstance(query, str):
+            raise TypeError(f"❌ [ERROR] 잘못된 query 타입: {type(query)}")
+
+        # ✅ 세션 초기화 명령 처리
+        if query.lower() == "reset":
+            if session_id:
+                clear_message_history(session_id)
+            return {"message": f"세션 {session_id}의 대화 기록이 초기화되었습니다."}
+
+        # ✅ Redis 세션 기록 불러오기 및 최신 입력 저장
+        session_history = get_session_history(session_id)
+        session_history.add_user_message(query)
+
         previous_queries = [msg.content for msg in session_history.messages if isinstance(msg, HumanMessage)]
-        # ✅ 현재 입력값이 이전 대화에 이미 있다면 제거 (중복 방지)
         if query in previous_queries:
             previous_queries.remove(query)
-        print(f"🔁 [Step 5] 최신 Redis 대화 내역: {previous_queries}")
         
-        print("🔍 [DEBUG] Redis 메시지 저장 순서 확인:")
-        for i, msg in enumerate(session_history.messages):
-            print(f"{i+1}번째 ▶️ {type(msg).__name__} | 내용: {msg.content}")
+        # ✅ 전체 중복 제거 (최신 입력을 제외한 나머지에서)
+        previous_queries = list(dict.fromkeys(previous_queries))
 
-        # ✅ [Step 6] LLM 키워드 추출
-        llm_start = time.time()
-        combined_query = " ".join(previous_queries + [query])
-        print(f"🔍 [Step 6-1] combined_query: {combined_query}")
+        # ✅ LLM으로 정제된 쿼리 생성
+        UserMessage = minimal_clean_with_llm(query, previous_queries)
+        print("\n🧾 [최종 정제된 문장] →", UserMessage)
+        print("📚 [원본 전체 문맥] →", " | ".join(previous_queries + [query]))
 
-        if not combined_query or not isinstance(combined_query, str):
-            raise ValueError(f"❌ [ERROR] combined_query가 올바른 문자열이 아닙니다: {combined_query} (타입: {type(combined_query)})")
+        # ✅ 임베딩 벡터 생성
+        q_vec = np.array([emb_model.embed_query(UserMessage)], dtype=np.float32).tolist()
 
-        combined_keywords = extract_keywords_with_llm(combined_query)
-        llm_time = time.time() - llm_start
+        # ✅ Milvus 벡터 검색 수행
+        milvus_results = collection.search(
+            data=q_vec,
+            anns_field="emb",
+            param={"metric_type": "L2", "params": {"nprobe": 10}},
+            limit=5,
+            output_fields=[
+                "product_code", "market_product_name", "market_price",
+                "shipping_fee", "image_url", "description",
+                "origin", "max_quantity"
+            ]
+        )
 
-        if not combined_keywords or not isinstance(combined_keywords, str):
-            raise ValueError(f"❌ [ERROR] 키워드 추출 실패: {combined_keywords}")
-
-        print(f"🔍 [Step 6-2] combined_keywords: {combined_keywords}")
-        print(f"📊 [Step 6-3] LLM 키워드 추출 시간: {llm_time:.4f} 초")
-
-        # ✅ [Step 7] 엑셀 데이터 로드
-        excel_start = time.time()
-        try:
-            _, data = load_excel_to_texts("db/ownerclan_주간인기상품_0428.xlsx")
-        except Exception as e:
-            raise ValueError(f"❌ [ERROR] 엑셀 데이터 로딩 실패: {e}")
-
-        excel_time = time.time() - excel_start
-        print(f"📊 [Step 7] 엑셀 데이터 로드 시간: {excel_time:.4f} 초")
-
-        # ✅ [Step 8] OpenAI 임베딩 생성
-        embedding_start = time.time()
-        try:
-            query_embedding = embed_texts_parallel([combined_keywords], EMBEDDING_MODEL)
-            faiss.normalize_L2(query_embedding)
-        except Exception as e:
-            raise ValueError(f"❌ [ERROR] 임베딩 생성 실패: {e}")
-
-        embedding_time = time.time() - embedding_start
-        print(f"📊 [Step 8] OpenAI 임베딩 생성 시간: {embedding_time:.4f} 초")
-
-        # ✅ [Step 9] FAISS 검색 수행
-        faiss_start = time.time()
-        try:
-            D, I = index.search(query_embedding, k=5)
-        except Exception as e:
-            raise ValueError(f"❌ [ERROR] FAISS 검색 실패: {e}")
-
-        faiss_time = time.time() - faiss_start
-        print(f"📊 [Step 9] FAISS 검색 시간: {faiss_time:.4f} 초")
-
-
-        # ✅ [Step 10] 검색 결과 유효성 검사
-        if I is None or not I.any():
-            print("❌ [ERROR] FAISS 검색 결과 없음")
-            return {
-                "query": query,
-                "results": [],
-                "message": "검색 결과가 없습니다. 다른 키워드를 입력하세요!",
-                "message_history": [
-                    {"type": type(msg).__name__, "content": msg.content if hasattr(msg, "content") else str(msg)}
-                    for msg in session_history.messages
-                ],
-            }
-
-        # ✅ [Step 11] 검색 결과 JSON 변환
+        # ✅ Milvus 검색 결과 가공
         results = []
-        for idx_list in I:
-            for idx in idx_list:
-                if idx >= len(data):
-                    print(f"❌ [ERROR] 잘못된 인덱스: {idx}")
-                    continue
-
+        for hits in milvus_results:
+            for hit in hits:
                 try:
-                    result_row = data.iloc[idx]
+                    e = hit.entity
 
-                    # ✅ 상품상세설명 -> base64 인코딩 (디코딩 에러 방지)
-                    html_raw = result_row.get("본문상세설명", "") or ""
+                    # ▶ 본문 → 미리보기 링크 생성
+                    html_raw = e.get("description", "") or ""
                     html_cleaned = clean_html_content(html_raw)
+                    if isinstance(html_raw, bytes):
+                        html_raw = html_raw.decode("cp949")
+                    encoded_html = base64.b64encode(html_cleaned.encode("utf-8", errors="ignore")).decode("utf-8")
+                    safe_html = urllib.parse.quote_plus(encoded_html)
+                    preview_url = f"{API_URL}/preview?html={safe_html}"
+                except Exception as err:
+                    print(f"⚠️ 본문 처리 중 오류: {err}")
+                    preview_url = "https://naver.com"
 
-                    try:
-                        if isinstance(html_raw, bytes):
-                            html_raw = html_raw.decode("cp949")  # 혹시 바이너리 형태일 경우 디코딩
-                    except Exception as e:
-                        print(f"⚠️ [본문 디코딩 경고] cp949 디코딩 실패: {e}")
+                # ▶ 상품링크 결정
+                product_link = e.get("product_link", "")
+                if not product_link or product_link in ["링크 없음", "#", None]:
+                    product_link = preview_url
 
-                    try:
-                        encoded_html = base64.b64encode(html_cleaned.encode("utf-8", errors="ignore")).decode("utf-8")
-                        safe_html = urllib.parse.quote_plus(encoded_html)
-                        preview_url = f"{API_URL}/preview?html={safe_html}"
-                    except Exception as e:
-                        print(f"❌ [본문 인코딩 실패] {e}")
-                        preview_url = "https://naver.com"
+                # ▶ 옵션 정보 파싱
+                option_raw = str(e.get("composite_options", "")).strip()
+                option_display = "없음"
+                if option_raw.lower() not in ["", "nan"]:
+                    parsed = []
+                    for line in option_raw.splitlines():
+                        try:
+                            name, extra, _ = line.split(",")
+                            extra = int(float(extra))
+                            parsed.append(f"{name.strip()} {f'(＋{extra:,}원)' if extra>0 else ''}".strip())
+                        except Exception:
+                            parsed.append(line.strip())
+                    option_display = "\n".join(parsed)
 
-                    # ✅ 상품링크가 비어있다면 preview_url 사용
-                    product_link = result_row.get("상품링크", "")
-                    if not product_link or product_link in ["링크 없음", "#", None]:
-                        product_link = preview_url
-
-                    # ✅ 옵션 처리: 조합형옵션 → '옵션명 (+가격)' 형식, 재고는 표시 안함
-                    option_raw = str(result_row.get("조합형옵션", "")).strip()
-                    option_display = "없음"
-                    if option_raw and option_raw.lower() != "nan":
-                        option_lines = option_raw.splitlines()
-                        parsed_options = []
-                        for line in option_lines:
-                            try:
-                                name, extra_price, _ = line.split(",")
-                                extra_price = int(float(extra_price))
-                                price_str = f"(+{extra_price:,}원)" if extra_price > 0 else ""
-                                parsed_options.append(f"{name} {price_str}".strip())
-                            except Exception as e:
-                                print(f"⚠️ 옵션 파싱 실패: {line} → {e}")
-                                parsed_options.append(name)
-                        option_display = "\n".join(parsed_options)
-
-                    result_info = {
-                        "상품코드": str(result_row.get("상품코드", "없음")),
-                        "제목": result_row.get("마켓상품명", "제목 없음"),
-                        "가격": convert_to_serializable(result_row.get("마켓실제판매가", 0)),
-                        "배송비": convert_to_serializable(result_row.get("배송비", 0)),
-                        "이미지": result_row.get("이미지중", "이미지 없음"),
-                        "원산지": result_row.get("원산지", "정보 없음"),
-                        "상품링크": product_link,
-                        "옵션": option_display,
-                        "조합형옵션": option_raw,
-                        "최대구매수량": convert_to_serializable(result_row.get("최대구매수량", 0))
-                    }
-                    results.append(result_info)
-                    
-                    # ✅ 상품 코드 기준으로 캐시에 저장
-                    PRODUCT_CACHE[result_info["상품코드"]] = result_info
-
-                except KeyError as e:
-                    print(f"❌ [ERROR] KeyError: {e}")
-                continue
+                # ▶ 결과 정리
+                result_info = {
+                    "상품코드":     str(e.get("product_code", "없음")),
+                    "제목":         e.get("market_product_name", "제목 없음"),
+                    "가격":         convert_to_serializable(e.get("market_price", 0)),
+                    "배송비":       convert_to_serializable(e.get("shipping_fee", 0)),
+                    "이미지":       e.get("image_url", "이미지 없음"),
+                    "원산지":       e.get("origin", "정보 없음"),
+                    "상품링크":     product_link,
+                    "옵션":         option_display,
+                    "조합형옵션":   option_raw,
+                    "최대구매수량": convert_to_serializable(e.get("max_quantity", 0))
+                }
+                results.append(result_info)
+                PRODUCT_CACHE[result_info["상품코드"]] = result_info
 
 
-        if not results:
-            return {"query": query, "results": [], "message": "검색 결과가 없습니다."}
+        message_history = [
+            {"type": type(msg).__name__, "content": msg.content if hasattr(msg, "content") else str(msg)}
+            for msg in session_history.messages
+        ]
 
-        # ✅ results를 텍스트로 변환
-        if results:
-            results_text = "<br>".join(
-                [
-                    f"상품코드: {item['상품코드']}, 제목: {item['제목']}, 가격: {item['가격']}원, "
-                    f"배송비: {item['배송비']}원, 원산지: {item['원산지']}, 이미지: {item['이미지']}"
-                    for item in results
-                ]
-            )
-        else:
-            results_text = "검색 결과가 없습니다."
-        
-        
-        # ✅ [Step 12] LLM 기반 대화 응답 생성
-        message_history=[]
-        start_response = time.time()    
-        # ✅ ChatPromptTemplate 및 RunnableWithMessageHistory 생성
+        raw_results_json = json.dumps(results[:5], ensure_ascii=False)
+        raw_history_json = json.dumps(message_history, ensure_ascii=False)
+        escaped_results = raw_results_json.replace("{", "{{").replace("}", "}}")
+        escaped_history = raw_history_json.replace("{", "{{").replace("}", "}}")
+
+        # ✅ LangChain 기반 프롬프트 및 LLM 실행 설정
+        API_KEY = os.environ.get("OPENAI_API_KEY")
         llm = ChatOpenAI(model="gpt-4o-mini", openai_api_key=API_KEY)
         prompt = ChatPromptTemplate.from_messages([
             ("system", """
         당신은 쇼핑몰 챗봇으로, 친절하고 인간적인 대화를 통해 고객의 쇼핑 경험을 돕습니다.
         사용자의 언어에 맞게 번역해서 답변하세요(예시: 한국어->한국어, 영어->영어, 베트남어->베트남어 등)
 
-        🎯 목표:
+        목표:
         - 사용자의 요구를 이해하고 대화의 맥락을 반영하여 적합한 상품을 추천합니다.
 
-        ⚙️ 작동 방식:
+        작동 방식:
         - 대화 이력을 참고해 문맥을 파악하고 사용자의 요청에 맞는 상품을 연결합니다.
         - 필요한 경우 후속 질문으로 사용자의 요구를 구체화합니다.
 
-        📌 주의사항:
+        주의사항:
         - 아래 검색 결과는 LLM 내부 참고용입니다.
         - 상품을 나열하거나 직접 출력하지 마세요.
         - 키워드 요약이나 후속 질문을 위한 참고용으로만 활용하세요.
         """),
-
             MessagesPlaceholder(variable_name="message_history"),
-
-            ("system", f"[검색 결과 - 내부 참고용 JSON]\n{json.dumps(results[:5], ensure_ascii=False).replace('{', '{{').replace('}', '}}')}"),
-
-
-            ("system", f"[이전 대화 내용]\n{message_history}"),
-
+            ("system", f"[검색 결과 - 내부 참고용 JSON]\n{escaped_results}"),
+            ("system", f"[이전 대화 내용]\n{escaped_history}"),
             ("human", query)
         ])
-        
+
         runnable = prompt | llm
         with_message_history = RunnableWithMessageHistory(
             runnable,
             get_session_history,
-            input_messages_key="input",  # 입력 메시지의 키
+            input_messages_key="input",
             history_messages_key="message_history",
         )
 
-        # ✅ LLM 실행 및 메시지 기록 업데이트
+        # ✅ 응답 생성 및 시간 측정
+        start_response = time.time()
         response = with_message_history.invoke(
             {"input": query},
             config={"configurable": {"session_id": session_id}}
         )
+        print(f"📊 [LLM 응답 시간] {time.time() - start_response:.2f}초")
+        print("🤖 응답 결과:", response.content)
 
-        response_time = time.time() - start_response
-        print(f"📊 [Step 12] LLM 응답 생성 시간: {response_time:.4f} 초")
-
-        # ✅ 메시지 기록을 Redis에서 가져오기
-        session_history = get_session_history(session_id)
-        message_history = [
-            {"type": type(msg).__name__, "content": msg.content if hasattr(msg, "content") else str(msg)}
-            for msg in session_history.messages
-        ]
-
-
-        # ✅ 출력 디버깅
-        #print("*** Response:", response)
-        #print("*** Message History:", message_history)
-        #print("✅✅✅✅*✅✅✅✅ Results:", results)
-        #print(f"✅ [Before Send] Results Type: {type(results[:5])}")
-        #print(f"✅ [Before Send] Results Content: {results[:5]}")
-
-        # ✅ Combined Message 만들기 (검색 결과 + LLM 응답)
-        combined_message_text = f"🤖 AI 답변: {response.content}"
-        print(f"🔍 [Step 12-1] Combined Message: {combined_message_text}")
-        
-        # ✅ JSON 반환
-        return {
-            "query": query,
-            "results": results,
-            "combined_message_text": combined_message_text,
-            "message_history": message_history
+        # ✅ 최종 결과 반환 및 출력 로그
+        result_payload = {
+            "query": query,  # 사용자가 입력한 원본 쿼리
+            "UserMessage": UserMessage,  # 정제된 쿼리
+            "RawContext": previous_queries + [query],  # 전체 대화 맥락
+            "results": results,  # 검색 결과 리스트
+            "combined_message_text": response.content,  # LLM이 생성한 자연어 응답
+            "message_history": message_history  # 전체 메시지 기록 (디버깅용)
         }
-        
-    
-        # 전체 처리 시간 로깅
-        total_time = time.time() - start_time
-        logger.info(f"📊 [Total Time] 전체 external_search_and_generate_response 처리 시간: {total_time:.4f} 초")
+        print("\n📦 반환 객체 요약")
+        print("query:", result_payload["query"])
+        print("UserMessage:", result_payload["UserMessage"])
+        print("RawContext:", result_payload["RawContext"])
+        print("combined_message_text:", result_payload["combined_message_text"])
+        print("results (count):", len(result_payload["results"]))
+        print("message_history (count):", len(result_payload["message_history"]))
+
+        return result_payload
 
     except Exception as e:
-        print(f"❌ 오류 발생: {e}")
+        print(f"❌ external_search_and_generate_response 오류: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 def send_message(sender_id: str, messages: list):  
     try:  
@@ -1066,7 +856,7 @@ def handle_product_selection(data: Product_Selections):
                     }
                 ]
             }
-        }AS
+        }
 
     except Exception as e:
         print(f"❌ 상품 선택 처리 오류: {e}")
@@ -1080,7 +870,7 @@ def handle_product_selection(data: Product_Selections):
 
 
 class Option_Selections(BaseModel):
-    version: strz
+    version: str
     field: str
     value: dict
     page: Optional[int] = 1
